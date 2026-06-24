@@ -1,5 +1,4 @@
 import { useAuth } from "./AuthContext"
-import { supabase } from "./supabase"
 import React, { useState, useEffect, useMemo } from "react";
 import { LineChart, Line, AreaChart, Area, PieChart, Pie, Cell, BarChart, Bar, ComposedChart, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from "recharts";
 import * as XLSX from "xlsx";
@@ -172,17 +171,23 @@ const CATKEY = "networth-categories";
 
 export default function App() {
   const { user, signOut } = useAuth()
-  const [categories, setCategories] = useState(SEED_CATEGORIES);
+  // Only pre-load seed data for the owner account.
+  // All other users start with a blank slate.
+  const isOwner = !user || user?.email === import.meta.env.VITE_OWNER_EMAIL;
+
+  const [categories, setCategories] = useState(isOwner ? SEED_CATEGORIES : []);
   const [snapshots, setSnapshots] = useState(() =>
-    SEED_DATES.map((date, i) => ({
-      id: "seed-" + i,
-      date,
-      values: Object.fromEntries(SEED_CATEGORIES.map(c => [c, SEED_VALUES[c][i]])),
-      fxRates: { ...DEFAULT_FX_TO_INR }, // INR per unit of USD/AED on this date — edit for historical accuracy
-    }))
+    isOwner
+      ? SEED_DATES.map((date, i) => ({
+          id: "seed-" + i,
+          date,
+          values: Object.fromEntries(SEED_CATEGORIES.map(c => [c, SEED_VALUES[c][i]])),
+          fxRates: { ...DEFAULT_FX_TO_INR },
+        }))
+      : []
   );
-  const [costBasis, setCostBasis] = useState(COST_BASIS);
-  const [classMap, setClassMap] = useState(ASSET_CLASS_MAP);
+  const [costBasis, setCostBasis] = useState(isOwner ? COST_BASIS : {});
+  const [classMap, setClassMap] = useState(isOwner ? ASSET_CLASS_MAP : {});
   const [transactions, setTransactions] = useState([]); // {id, date, type: 'income'|'expense', category, description, amount}
   const [displayCurrency, setDisplayCurrency] = useState("INR");
   const [fxRates, setFxRates] = useState(DEFAULT_FX_TO_INR); // 1 unit of currency = X INR
