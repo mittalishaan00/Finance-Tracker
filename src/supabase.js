@@ -4,7 +4,7 @@ const supabaseUrl = import.meta.env.VITE_SUPABASE_URL
 const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY
 
 if (!supabaseUrl || !supabaseAnonKey) {
-  console.warn('Supabase credentials not set — running in offline mode (data saves to localStorage only)')
+  console.warn('Supabase credentials not set — running in offline mode')
 }
 
 export const supabase = supabaseUrl && supabaseAnonKey

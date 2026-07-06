@@ -1,165 +1,75 @@
 # Finance Tracker
 
-A personal net worth and cash flow dashboard. Fully client-side — your financial data never touches any third-party server except your own Supabase database.
-
-## Features
-
-- Net worth tracking with historical snapshots
-- Cash flow (income & expenses) with categorisation rules
-- Budget vs actual comparison
-- PDF and CSV statement import (parsed locally in your browser)
-- Historical FX rates for AED/USD/INR
-- Multi-currency display (INR / USD / AED)
-- XIRR-based return calculation
-- Excel export/import
-
----
+Personal net worth & cash flow dashboard. Each user's data is fully isolated — stored in their own Supabase row with Row Level Security.
 
 ## Deploy in 4 steps
 
-### 1. Set up Supabase (free)
-
-1. Go to [supabase.com](https://supabase.com) and create a free account
-2. Create a new project (pick any name and region)
-3. Once created, go to **SQL Editor** and run the contents of `supabase-setup.sql`
-4. Go to **Settings → API** and copy:
-   - **Project URL** (looks like `https://xxxxx.supabase.co`)
-   - **anon public** key
+### 1. Set up Supabase (free, ~10 min)
+1. Create account at [supabase.com](https://supabase.com) → New project
+2. SQL Editor → paste `supabase-setup.sql` → Run
+3. Settings → API → copy **Project URL** and **anon public** key
 
 ### 2. Configure environment
-
 ```bash
 cp .env.example .env.local
 ```
-
-Edit `.env.local`:
+Fill in `.env.local`:
 ```
-VITE_SUPABASE_URL=https://your-project-id.supabase.co
-VITE_SUPABASE_ANON_KEY=your-anon-key-here
+VITE_SUPABASE_URL=https://your-project.supabase.co
+VITE_SUPABASE_ANON_KEY=your-anon-key
 VITE_OWNER_EMAIL=your-email@example.com
 ```
+> `VITE_OWNER_EMAIL` — your email. Only this account gets pre-loaded with `ownerSeed.json`. Everyone else starts blank.
 
-> `VITE_OWNER_EMAIL` controls whose account sees the pre-loaded demo/seed data. Set it to your email. Everyone else starts with a blank slate.
+### 3. Deploy to Vercel (free, ~5 min)
+Push to GitHub → [vercel.com](https://vercel.com) → New Project → import repo → add the 3 env vars → Deploy.
 
-### 3. Enable Google sign-in (optional but recommended)
-
-In Supabase dashboard:
-1. Go to **Authentication → Providers → Google**
-2. Enable it and follow the instructions to create a Google OAuth app
-3. Add your deployment URL to the allowed redirect URLs
-
-If you skip this, users can still sign up with email/password.
-
-### 4. Deploy to Vercel (free)
-
-**Option A: GitHub (recommended)**
-
-1. Push this folder to a GitHub repository
-2. Go to [vercel.com](https://vercel.com) → New Project → Import from GitHub
-3. Add environment variables in Vercel's dashboard (same as `.env.local`)
-4. Deploy — done
-
-**Option B: Vercel CLI**
-
+Or via CLI:
 ```bash
-npm install -g vercel
-vercel --prod
+npm install && npx vercel --prod
 ```
 
-Vercel will prompt you to add environment variables.
+### 4. Port your personal data
+1. In the Claude artifact → header → **Download backup (.json)**
+2. Rename to `ownerSeed.json` → place in `public/`
+3. Redeploy
+4. Log in with your owner email — data imports automatically on first login
+
+> After first login, delete `ownerSeed.json` from `public/` and redeploy — your data is safely in Supabase by then.
 
 ---
 
-## Run locally
+## Data isolation
 
-```bash
-npm install
-npm run dev
-```
+Each user's data is:
+- Stored in their own Supabase row, protected by Row Level Security
+- Cached in localStorage under a user-ID-scoped key (`finance-tracker-{userId}`)
+- Cleared from localStorage on sign-out
 
-Open [http://localhost:5173](http://localhost:5173)
-
----
-
-## Running without Supabase (offline mode)
-
-If you don't set up Supabase credentials, the app runs in single-user mode with data stored in `localStorage`. No login required. Useful for local personal use.
-
----
-
-## Architecture
-
-```
-src/
-  main.jsx          # React entry point
-  Root.jsx          # Auth gate + window.storage shim
-  App.jsx           # Main application (all features)
-  AuthContext.jsx   # Supabase auth state
-  LoginPage.jsx     # Sign in / sign up UI
-  storage.js        # Saves to Supabase + localStorage
-  supabase.js       # Supabase client
-```
-
-**Data model:** Each user has a single row in `user_data` containing their entire app state as a JSON blob. This keeps the schema simple and makes backup/restore trivial.
-
-**Security:**
-- Row Level Security in Supabase ensures users can only ever access their own data
-- The Supabase anon key is safe to expose in client-side code — it only allows what RLS permits
-- No financial data is sent to any server other than your own Supabase project
+Switching accounts on the same device always loads the correct user's data.
 
 ---
 
 ## Troubleshooting
 
-**Login page shows but I can't get in after signing up**
-
-Supabase requires email confirmation by default. Either:
-- Check your inbox for a confirmation email and click the link, **or**
-- Disable it: Supabase Dashboard → **Authentication → Settings → Email** → turn off "Enable email confirmations"
+**Stuck on login page after signing up**
+Supabase requires email confirmation by default.
+- Check inbox for confirmation email, OR
+- Supabase Dashboard → Authentication → Settings → Email → disable "Enable email confirmations"
 
 **Google sign-in redirects back to login**
+Supabase → Authentication → URL Configuration → Redirect URLs → add your Vercel URL
 
-Add your site's URL to Supabase: **Authentication → URL Configuration → Redirect URLs** → add `https://your-app.vercel.app`
-
-**Data not saving across devices**
-
-Make sure you ran `supabase-setup.sql` in the SQL editor. Without the `user_data` table, Supabase saves silently fail and the app falls back to localStorage (device-only).
+**Data not syncing across devices**
+Make sure you ran `supabase-setup.sql`. Without the table, saves fall back to localStorage silently.
 
 ---
 
-- **Branding**: edit the app name and colours at the top of `App.jsx`
-- **Default categories**: edit `DEFAULT_INCOME_CATEGORIES` and `DEFAULT_EXPENSE_CATEGORIES`
-- **Seed data**: remove or replace `SEED_DATES` / `SEED_VALUES` at the top of `App.jsx` if you don't want demo data pre-loaded
-
----
-
-## Porting your personal data to the website
-
-Your financial data lives in the Claude artifact. To get it into your account on the deployed website:
-
-### Step 1 — Export from the artifact
-
-In the Claude artifact (this chat), go to the header → **Download backup (.json)**. This downloads a file called something like `networth-backup-2026-06-24.json`.
-
-### Step 2 — Add it to the project
-
-Rename the file to exactly `ownerSeed.json` and place it in the `public/` folder:
-
-```
-finance-app/
-  public/
-    favicon.svg
-    ownerSeed.json   ← put it here
+## Running locally
+```bash
+npm install
+npm run dev
+# open http://localhost:5173
 ```
 
-### Step 3 — Deploy
-
-Push to GitHub / redeploy on Vercel as normal. Vercel will serve `ownerSeed.json` as a static file.
-
-### Step 4 — First login
-
-Log into the website with your owner email (`VITE_OWNER_EMAIL`). If your Supabase account has no data yet, the app detects this and automatically imports `ownerSeed.json` into your account, then reloads. You'll see "Importing your data…" for a moment.
-
-**This only runs once** — on subsequent logins it sees your data already exists and skips the seed. The `ownerSeed.json` file remains in `public/` but is only used on first login.
-
-> ⚠️ `ownerSeed.json` contains your financial data. It is served publicly (anyone who knows the URL can download it). If this concerns you, delete it from `public/` after your first login — the data is safely in Supabase by then.
+Without `.env.local`, runs as anonymous single-user with localStorage only.

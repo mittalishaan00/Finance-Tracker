@@ -4,28 +4,22 @@ import { supabase } from './supabase'
 const AuthContext = createContext(null)
 
 export function AuthProvider({ children }) {
-  const [user, setUser] = useState(undefined) // undefined = loading, null = not logged in
+  const [user, setUser] = useState(undefined)
   const [loading, setLoading] = useState(true)
 
   useEffect(() => {
     if (!supabase) {
-      // No Supabase configured — run as anonymous single-user app
       setUser(null)
       setLoading(false)
       return
     }
-
-    // Get current session
     supabase.auth.getSession().then(({ data: { session } }) => {
       setUser(session?.user ?? null)
       setLoading(false)
     })
-
-    // Listen for auth changes
     const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
       setUser(session?.user ?? null)
     })
-
     return () => subscription.unsubscribe()
   }, [])
 
@@ -45,7 +39,17 @@ export function AuthProvider({ children }) {
   }
 
   async function signOut() {
-    await supabase.auth.signOut()
+    // Clear this user's localStorage cache on sign-out
+    if (user?.id) {
+      localStorage.removeItem(`finance-tracker-${user.id}`)
+    }
+    // Also drop the injected storage shim immediately so nothing in the
+    // current tab can read/write the outgoing user's data before the
+    // next login's Root effect re-injects a freshly-scoped shim.
+    if (typeof window !== 'undefined') {
+      window.storage = undefined
+    }
+    await supabase?.auth.signOut()
   }
 
   return (

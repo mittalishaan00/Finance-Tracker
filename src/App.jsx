@@ -3,60 +3,18 @@ import React, { useState, useEffect, useMemo } from "react";
 import { LineChart, Line, AreaChart, Area, PieChart, Pie, Cell, BarChart, Bar, ComposedChart, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from "recharts";
 import * as XLSX from "xlsx";
 
-// ---------- Seed data derived from uploaded sheet ----------
-const SEED_DATES = [
-  "13 May 2025","18 May 2025","3 Jun 2025","27 Jun 2025","5 Jul 2025","25 Jul 2025",
-  "7 Oct 2025","9 Nov 2025","29 Nov 2025","8 Jan 2026","7 Feb 2026","17 Mar 2026",
-  "27 Mar 2026","25 Apr 2026","21 May 2026","29 May 2026"
-];
-
-const SEED_CATEGORIES = [
-  "Mutual Funds","Mutual Funds - Coin","Bank - NRO","Bank - NRE","Zerodha","FD","PF",
-  "UAE Bank account","Private Equity - OfBusiness","Interactive Brokers","Private Equity - Swiggy"
-];
-
-// row data: category -> array aligned with SEED_DATES (16 entries)
-const SEED_VALUES = {
-  "Mutual Funds":            [622584,635488,640333,659866,664370,656771,654025,657233,663329,661758,641183,590808,593891,630430,635904,645136],
-  "Mutual Funds - Coin":      [1151399,1181650,1195434,1231926,1244734,1245140,1229095,1230644,1234139,1225756,1184379,1107511,1116791,1203080,1226379,1248771],
-  "Bank - NRO":               [24262,24262,24262,24254,48579,49158,52338,57385,82719,12259,192470,6160,84856,210818,290838,295621],
-  "Bank - NRE":               [269105,269105,269105,1089101,1057431,557431,1203866,1090437,1027223,261892,534491,508359,370580,373697,373693,373689],
-  "Zerodha":                  [1518521,1543607,1528907,1577349,1552502,1519404,1740929,1882616,1937844,1946868,2151459,2278931,2260015,2428650,2416573,2438159],
-  "FD":                       [1282055,1282055,1327891,1327891,1339073,1839073,1854023,1854023,1854023,1854023,2384957,2115623,2115623,2115623,2115623,2115623],
-  "PF":                       [329380,329380,329830,329830,329380,329380,329380,329380,329380,329380,329380,329380,329380,329380,329380,329380],
-  "UAE Bank account":         [1347655,1347655,1466500,1200286,1178596,1403463,1287857,1729560,1922784,2421024,2342525,2712125,4761475,5124750,5148832,5512286],
-  "Private Equity - OfBusiness": [100000,100000,100000,100000,100000,100000,100000,100000,100000,100000,100000,100000,100000,100000,0,0],
-  "Interactive Brokers":      [0,0,0,0,0,0,0,0,0,0,0,0,0,0,246048,650592],
-  "Private Equity - Swiggy":  [83905,86811,91757,109473,103662,110216,113595,108378,102243,95432,86486,76757,74784,78135,67770,73149],
-};
-
-const ASSET_CLASS_MAP = {
-  "Mutual Funds": "Equity",
-  "Mutual Funds - Coin": "Equity",
-  "Zerodha": "Equity",
-  "Interactive Brokers": "Equity",
-  "FD": "FD",
-  "PF": "PF",
-  "Bank - NRO": "Bank A/C",
-  "Bank - NRE": "Bank A/C",
-  "UAE Bank account": "Bank A/C",
-  "Private Equity - OfBusiness": "Private Equity",
-  "Private Equity - Swiggy": "Private Equity",
-};
-
-const COST_BASIS = {
-  "Mutual Funds": 420000,
-  "Mutual Funds - Coin": 1179941,
-  "Bank - NRO": 295621,
-  "Bank - NRE": 373689,
-  "Zerodha": 2292692,
-  "FD": 2115623,
-  "PF": 329380,
-  "UAE Bank account": 5512286,
-  "Private Equity - OfBusiness": 100000,
-  "Interactive Brokers": 640416,
-  "Private Equity - Swiggy": 100000,
-};
+// ---------- Seed data ----------
+// NOTE: This used to contain real, hardcoded personal net-worth figures.
+// That data is bundled into the client-side JS and shipped to every visitor
+// of the site (logged in or not) -- a serious data exposure on a public
+// Vercel deployment. It has been removed. New accounts now start empty;
+// each user's real data lives only in their own Supabase row (RLS-protected)
+// and is loaded at runtime via window.storage, never compiled into source.
+const SEED_DATES = [];
+const SEED_CATEGORIES = [];
+const SEED_VALUES = {};
+const ASSET_CLASS_MAP = {};
+const COST_BASIS = {};
 
 const DEFAULT_INCOME_CATEGORIES = ["Salary", "Bonus", "Dividends", "Interest", "Rental Income", "Other Income"];
 const DEFAULT_EXPENSE_CATEGORIES = ["Rent", "Groceries", "Utilities", "Travel", "Dining", "Shopping", "Healthcare", "Insurance", "Investment Fees", "Other Expense"];
@@ -172,7 +130,6 @@ const CATKEY = "networth-categories";
 export default function App() {
   const { user, signOut } = useAuth()
   // Only pre-load seed data for the owner account.
-  // All other users start with a blank slate.
   const isOwner = !user || user?.email === import.meta.env.VITE_OWNER_EMAIL;
 
   const [categories, setCategories] = useState(isOwner ? SEED_CATEGORIES : []);
@@ -302,13 +259,28 @@ export default function App() {
   // ---- Manual backup (export/import JSON) ----
   function exportBackup() {
     const data = { snapshots, categories, costBasis, classMap, transactions, displayCurrency, fxRates, categoryRules, incomeCategories, expenseCategories, budgets, exportedAt: new Date().toISOString() };
-    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `networth-backup-${new Date().toISOString().slice(0,10)}.json`;
-    a.click();
-    URL.revokeObjectURL(url);
+    const json = JSON.stringify(data, null, 2);
+    const filename = `networth-backup-${new Date().toISOString().slice(0,10)}.json`;
+    try {
+      // Try Blob/createObjectURL first (works in deployed app)
+      const blob = new Blob([json], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    } catch {
+      // Fallback: data URI (works in Claude artifact sandbox)
+      const a = document.createElement("a");
+      a.href = "data:application/json;charset=utf-8," + encodeURIComponent(json);
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+    }
     showToast("Backup downloaded");
   }
 
