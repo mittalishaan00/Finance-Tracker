@@ -29,9 +29,12 @@ export default function Root() {
 
     window.storage = {
       async get(key) {
-        const data = await loadData(userId)
-        if (!data) return null
-        return { key, value: typeof data === 'string' ? data : JSON.stringify(data) }
+        const result = await loadData(userId)
+        return {
+          key,
+          value: result.data ? JSON.stringify(result.data) : null,
+          status: result.status, // 'ok' | 'empty' | 'error'
+        }
       },
       async set(key, value) {
         const parsed = (() => {
@@ -55,7 +58,8 @@ export default function Root() {
 
     ;(async () => {
       const existing = await loadData(user.id)
-      if (existing && existing.snapshots && existing.snapshots.length > 0) return
+      if (existing.status === 'error') return // don't touch anything on a failed load
+      if (existing.data && existing.data.snapshots && existing.data.snapshots.length > 0) return
       try {
         const res = await fetch('/ownerSeed.json')
         if (!res.ok) return

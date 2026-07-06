@@ -27,19 +27,40 @@ export async function loadData(userId) {
         .select('data')
         .eq('user_id', userId)
         .single()
+
       if (!error && data?.data) {
         localStorage.setItem(key, JSON.stringify(data.data))
-        return data.data
+        return { status: 'ok', data: data.data }
       }
+
+      // PGRST116 = no row found for this user yet -- a genuinely new
+      // account, safe to start blank.
+      if (error && error.code === 'PGRST116') {
+        return { status: 'empty', data: null }
+      }
+
+      if (error) {
+        console.warn('Supabase load failed:', error.message)
+        return { status: 'error', data: null, error }
+      }
+
+      // No error, but also no data.data -- treat as empty.
+      return { status: 'empty', data: null }
     } catch (e) {
-      console.warn('Supabase load failed, using localStorage:', e.message)
+      // Network failure, RLS/auth issue, etc. This is NOT the same as
+      // "no data" -- the caller must not treat this as a blank slate,
+      // or it risks overwriting the user's real cloud data on next save.
+      console.warn('Supabase load failed:', e.message)
+      return { status: 'error', data: null, error: e }
     }
   }
 
   try {
     const raw = localStorage.getItem(key)
-    return raw ? JSON.parse(raw) : null
-  } catch { return null }
+    return { status: raw ? 'ok' : 'empty', data: raw ? JSON.parse(raw) : null }
+  } catch {
+    return { status: 'empty', data: null }
+  }
 }
 
 export async function saveData(userId, payload) {

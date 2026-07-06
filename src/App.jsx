@@ -184,6 +184,7 @@ export default function App() {
   const [importText, setImportText] = useState("");
   const [saveStatus, setSaveStatus] = useState("saved"); // saved | saving
   const [loaded, setLoaded] = useState(false);
+  const [loadError, setLoadError] = useState(false);
   const [tab, setTab] = useState("overview");
   const [editingSnap, setEditingSnap] = useState(null); // snapshot id being edited
   const [showNwImport, setShowNwImport] = useState(false);
@@ -212,9 +213,18 @@ export default function App() {
         setLoaded(true);
         return;
       }
-      try {
-        const res = await window.storage.get("data", false);
-        if (res && res.value) {
+      const res = await window.storage.get("data", false);
+
+      if (res.status === "error") {
+        // Real failure (network/auth/RLS) -- NOT the same as "no data yet".
+        // Do not set `loaded` true: that would arm the autosave effect
+        // below and it would overwrite the real cloud data with blanks.
+        setLoadError(true);
+        return;
+      }
+
+      if (res.status === "ok" && res.value) {
+        try {
           const parsed = JSON.parse(res.value);
           if (parsed.snapshots) setSnapshots(parsed.snapshots);
           if (parsed.categories) setCategories(parsed.categories);
@@ -227,17 +237,22 @@ export default function App() {
           if (parsed.incomeCategories) setIncomeCategories(parsed.incomeCategories);
           if (parsed.expenseCategories) setExpenseCategories(parsed.expenseCategories);
           if (parsed.budgets) setBudgets(parsed.budgets);
+        } catch (e) {
+          // Corrupt data is also a real failure -- don't proceed to autosave.
+          console.error("Failed to parse stored data:", e);
+          setLoadError(true);
+          return;
         }
-      } catch (e) {
-        // no data yet, use seed
       }
+      // status === "empty" means a genuinely new account -- safe to
+      // continue with blank state and allow autosave to create the first row.
       setLoaded(true);
     })();
   }, []);
 
   // persist
   useEffect(() => {
-    if (!loaded) return;
+    if (!loaded || loadError) return;
     if (saveStatus === "unavailable") return; // storage API not present in this view
     const save = async () => {
       setSaveStatus("saving");
@@ -1501,6 +1516,23 @@ export default function App() {
 
   function updateClassMap(cat, cls) {
     setClassMap(prev => ({ ...prev, [cat]: cls }));
+  }
+
+  if (loadError) {
+    return (
+      <div style={{ minHeight: "100vh", background: BG, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", fontFamily: "'Inter', system-ui, sans-serif", color: INK, gap: 16, padding: 24, textAlign: "center" }}>
+        <div style={{ fontSize: 18, fontWeight: 600 }}>Couldn't load your data</div>
+        <div style={{ color: MUTED, maxWidth: 420 }}>
+          We weren't able to reach your saved data just now. To protect your existing records, nothing will be saved until this succeeds — please check your connection and try again.
+        </div>
+        <button
+          onClick={() => window.location.reload()}
+          style={{ padding: "10px 20px", borderRadius: 8, border: "none", background: ACCENT, color: "#fff", fontWeight: 600, cursor: "pointer" }}
+        >
+          Retry
+        </button>
+      </div>
+    );
   }
 
   if (!loaded) {
