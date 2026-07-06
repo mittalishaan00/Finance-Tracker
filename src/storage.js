@@ -107,10 +107,38 @@ export async function saveData(userId, payload) {
   try { localStorage.setItem(key, JSON.stringify(payload)) } catch (e) {
     console.warn('localStorage save failed:', e.message)
   }
-  if (looksNonEmpty(payload) && userId) {
+
+  if (!userId) return
+
+  const nonEmpty = looksNonEmpty(payload)
+  if (nonEmpty) {
     localStorage.setItem(hasDataFlagKey(userId), '1')
+  } else {
+    const knownLocally = localStorage.getItem(hasDataFlagKey(userId)) === '1'
+    let existingIsNonEmpty = false
+    if (supabase) {
+      try {
+        const { data, error } = await fetchRow(userId)
+        if (!error && looksNonEmpty(data?.data)) existingIsNonEmpty = true
+      } catch (e) {
+        // Can't confirm what's currently stored -- treat as risky, same
+        // as if we knew it was non-empty, and refuse below.
+        existingIsNonEmpty = knownLocally || true
+      }
+    }
+    if (knownLocally || existingIsNonEmpty) {
+      // Either this browser has seen real data for this account before,
+      // or Supabase currently holds real data right now. Either way,
+      // refuse to overwrite it with something that looks empty. This is
+      // the final, unconditional checkpoint -- whatever upstream
+      // reasoning led here, an accidental wipe is worse than a
+      // temporarily-blocked save.
+      console.warn('Refused to save: payload looks empty but real data exists. Skipping Supabase write to avoid data loss.')
+      return
+    }
   }
-  if (supabase && userId) {
+
+  if (supabase) {
     try {
       const { error } = await supabase
         .from('user_data')
@@ -118,4 +146,11 @@ export async function saveData(userId, payload) {
       if (error) console.warn('Supabase save failed:', error.message)
     } catch (e) { console.warn('Supabase save failed:', e.message) }
   }
+}
+
+// Explicit, intentional wipe -- the only way to clear a "known non-empty"
+// account's local flag. Not wired into the UI; exists so a deliberate
+// reset is possible without weakening the guard above.
+export function forgetKnownNonEmpty(userId) {
+  if (userId) localStorage.removeItem(hasDataFlagKey(userId))
 }
