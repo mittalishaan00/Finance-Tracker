@@ -47,6 +47,15 @@ export async function loadData(userId) {
   const key = localKey(userId)
   const knownNonEmpty = userId ? localStorage.getItem(hasDataFlagKey(userId)) === '1' : false
 
+  const readLocalCache = () => {
+    try {
+      const raw = localStorage.getItem(key)
+      if (!raw) return null
+      const parsed = JSON.parse(raw)
+      return looksNonEmpty(parsed) ? parsed : null
+    } catch { return null }
+  }
+
   if (supabase && userId) {
     // Make sure the client actually has a session matching this user
     // before querying -- avoids the common race where the select fires
@@ -70,16 +79,9 @@ export async function loadData(userId) {
         }
 
         if (error && error.code === 'PGRST116') {
-          // Zero rows. If we've never confirmed this account had real
-          // data, this is plausibly a genuinely new account -- but
-          // retry briefly first in case it's just the session race.
+          // Zero rows. Retry briefly first in case it's just the session race.
           if (attempt < 2) { await sleep(250); continue }
-          if (knownNonEmpty) {
-            // We know this account has real data -- zero rows now is a
-            // failure, not a fresh account. Never treat it as empty.
-            return { status: 'error', data: null, error: new Error('Expected existing data but got zero rows') }
-          }
-          return { status: 'empty', data: null }
+          break
         }
 
         lastError = error
@@ -90,16 +92,34 @@ export async function loadData(userId) {
       }
     }
 
-    console.warn('Supabase load failed:', lastError?.message)
-    return { status: 'error', data: null, error: lastError }
-  }
+    // The live read failed or came back empty after retries. Before
+    // concluding anything, fall back to this browser's own last-known
+    // cache of this account's real data -- this is the actual fix for
+    // the login-timing race: rather than trying to perfectly predict
+    // whether "zero rows" means "new account" or "race," just prefer
+    // real cached data over a network hiccup whenever we have it.
+    const cached = readLocalCache()
+    if (cached) {
+      return { status: 'ok', data: cached }
+    }
 
-  try {
-    const raw = localStorage.getItem(key)
-    return { status: raw ? 'ok' : 'empty', data: raw ? JSON.parse(raw) : null }
-  } catch {
+    if (knownNonEmpty) {
+      // We've confirmed this account has real data before (in this
+      // browser), yet there's no cache and the live read failed -- treat
+      // as a genuine failure rather than a fresh account.
+      return { status: 'error', data: null, error: lastError ?? new Error('Expected existing data but got zero rows') }
+    }
+
+    if (lastError) {
+      console.warn('Supabase load failed:', lastError.message)
+      return { status: 'error', data: null, error: lastError }
+    }
+
     return { status: 'empty', data: null }
   }
+
+  const cached = readLocalCache()
+  return cached ? { status: 'ok', data: cached } : { status: 'empty', data: null }
 }
 
 export async function saveData(userId, payload) {

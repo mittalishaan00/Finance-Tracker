@@ -39,10 +39,6 @@ export function AuthProvider({ children }) {
   }
 
   async function signOut() {
-    // Clear this user's localStorage cache on sign-out
-    if (user?.id) {
-      localStorage.removeItem(`finance-tracker-${user.id}`)
-    }
     // Also drop the injected storage shim immediately so nothing in the
     // current tab can read/write the outgoing user's data before the
     // next login's Root effect re-injects a freshly-scoped shim.
