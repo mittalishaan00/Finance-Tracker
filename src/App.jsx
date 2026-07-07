@@ -207,24 +207,28 @@ export default function App() {
   // load from storage
   useEffect(() => {
     (async () => {
-      const hasStorage = true; // Root.jsx always injects window.storage
-      if (!hasStorage) {
-        setSaveStatus("unavailable");
-        setLoaded(true);
-        return;
-      }
-      const res = await window.storage.get("data", false);
+      try {
+        if (!window.storage || typeof window.storage.get !== "function") {
+          // Should never happen now that Root guarantees window.storage
+          // is configured before App ever mounts -- but if it somehow
+          // does, fail loudly into the retry screen rather than
+          // silently proceeding with blank state.
+          console.warn("window.storage not ready when App mounted");
+          setLoadError(true);
+          return;
+        }
 
-      if (res.status === "error") {
-        // Real failure (network/auth/RLS) -- NOT the same as "no data yet".
-        // Do not set `loaded` true: that would arm the autosave effect
-        // below and it would overwrite the real cloud data with blanks.
-        setLoadError(true);
-        return;
-      }
+        const res = await window.storage.get("data", false);
 
-      if (res.status === "ok" && res.value) {
-        try {
+        if (res.status === "error") {
+          // Real failure (network/auth/RLS) -- NOT the same as "no data yet".
+          // Do not set `loaded` true: that would arm the autosave effect
+          // below and it would overwrite the real cloud data with blanks.
+          setLoadError(true);
+          return;
+        }
+
+        if (res.status === "ok" && res.value) {
           const parsed = JSON.parse(res.value);
           if (parsed.snapshots) setSnapshots(parsed.snapshots);
           if (parsed.categories) setCategories(parsed.categories);
@@ -237,16 +241,16 @@ export default function App() {
           if (parsed.incomeCategories) setIncomeCategories(parsed.incomeCategories);
           if (parsed.expenseCategories) setExpenseCategories(parsed.expenseCategories);
           if (parsed.budgets) setBudgets(parsed.budgets);
-        } catch (e) {
-          // Corrupt data is also a real failure -- don't proceed to autosave.
-          console.error("Failed to parse stored data:", e);
-          setLoadError(true);
-          return;
         }
+        // status === "empty" means a genuinely new account -- safe to
+        // continue with blank state and allow autosave to create the first row.
+        setLoaded(true);
+      } catch (e) {
+        // Corrupt data, a thrown error from window.storage, or anything
+        // else unexpected -- never fall through to blank state silently.
+        console.error("Failed to load stored data:", e);
+        setLoadError(true);
       }
-      // status === "empty" means a genuinely new account -- safe to
-      // continue with blank state and allow autosave to create the first row.
-      setLoaded(true);
     })();
   }, []);
 

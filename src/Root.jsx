@@ -7,7 +7,7 @@
  * - Seeds owner data from ownerSeed.json on first login
  */
 
-import React, { useEffect, useState } from 'react'
+import React, { useEffect, useRef, useState } from 'react'
 import { useAuth } from './AuthContext'
 import { loadData, saveData, clearOtherUsersCache } from './storage'
 import LoginPage from './LoginPage'
@@ -17,7 +17,15 @@ import { supabase } from './supabase'
 export default function Root() {
   const { user, loading } = useAuth()
   const [seeding, setSeeding] = useState(false)
-  const [storageReady, setStorageReady] = useState(false)
+
+  // Tracks which userId (or null for signed-out) window.storage is
+  // currently configured for. Read directly during render -- not via a
+  // state value that only updates a render cycle later -- so App can
+  // never mount before window.storage actually matches the current user.
+  const configuredForRef = useRef('__unset__')
+  const currentUserId = user?.id ?? null
+  const storageReadyForCurrentUser = !loading && configuredForRef.current === currentUserId
+  const [, forceRerender] = useState(0)
 
   // Inject window.storage shim, scoped to the current user
   useEffect(() => {
@@ -47,12 +55,17 @@ export default function Root() {
       async list() { return { keys: [] } },
     }
 
-    setStorageReady(true)
+    // Mark this userId as configured, then force one re-render. On that
+    // re-render, storageReadyForCurrentUser reads as true for the first
+    // time -- guaranteeing window.storage was set in an earlier commit,
+    // never the same one that mounts App.
+    configuredForRef.current = userId
+    forceRerender(n => n + 1)
   }, [user, loading])
 
   // On first login by the owner, seed personal data from ownerSeed.json
   useEffect(() => {
-    if (!user || !supabase || !storageReady) return
+    if (!user || !supabase || !storageReadyForCurrentUser) return
     const ownerEmail = import.meta.env.VITE_OWNER_EMAIL
     if (!ownerEmail || user.email !== ownerEmail) return
 
@@ -73,9 +86,9 @@ export default function Root() {
         setSeeding(false)
       }
     })()
-  }, [user, storageReady])
+  }, [user, storageReadyForCurrentUser])
 
-  if (loading || !storageReady || seeding) {
+  if (loading || !storageReadyForCurrentUser || seeding) {
     return (
       <div style={{ minHeight: '100vh', background: '#fbf8f4', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', fontFamily: 'system-ui', color: '#8a8178', fontSize: 14, gap: 12 }}>
         <div>{seeding ? 'Importing your data…' : 'Loading…'}</div>
