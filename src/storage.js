@@ -110,32 +110,20 @@ export async function saveData(userId, payload) {
 
   if (!userId) return
 
-  const nonEmpty = looksNonEmpty(payload)
-  if (nonEmpty) {
+  if (looksNonEmpty(payload)) {
     localStorage.setItem(hasDataFlagKey(userId), '1')
   } else {
-    const knownLocally = localStorage.getItem(hasDataFlagKey(userId)) === '1'
-    let existingIsNonEmpty = false
-    if (supabase) {
-      try {
-        const { data, error } = await fetchRow(userId)
-        if (!error && looksNonEmpty(data?.data)) existingIsNonEmpty = true
-      } catch (e) {
-        // Can't confirm what's currently stored -- treat as risky, same
-        // as if we knew it was non-empty, and refuse below.
-        existingIsNonEmpty = knownLocally || true
-      }
-    }
-    if (knownLocally || existingIsNonEmpty) {
-      // Either this browser has seen real data for this account before,
-      // or Supabase currently holds real data right now. Either way,
-      // refuse to overwrite it with something that looks empty. This is
-      // the final, unconditional checkpoint -- whatever upstream
-      // reasoning led here, an accidental wipe is worse than a
-      // temporarily-blocked save.
-      console.warn('Refused to save: payload looks empty but real data exists. Skipping Supabase write to avoid data loss.')
-      return
-    }
+    // Unconditional rule, no exceptions: a payload with no snapshots,
+    // transactions, categories, cost basis, or asset classes is never
+    // written to Supabase. There is no legitimate everyday reason for
+    // real user data to autosave down to nothing, so this can only be a
+    // bug (a stale/blank in-memory state, a load race, a bad remount,
+    // etc). Refusing here -- rather than trying to detect whether THIS
+    // particular empty state is "safe" -- removes the race condition
+    // entirely, because there is nothing left to race: empty payloads
+    // simply never reach the network call that could destroy real data.
+    console.warn('Refused to save: payload is empty. Skipping Supabase write to avoid overwriting real data.')
+    return
   }
 
   if (supabase) {
