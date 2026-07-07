@@ -1008,6 +1008,124 @@ export default function App() {
     return "Other Expense";
   }
 
+  // ---- Duplicate detection ----
+  // Strips punctuation, currency noise, and long reference/auth-code numbers so
+  // that cosmetic differences (extra whitespace, a transaction ref appended by
+  // the bank) don't defeat matching.
+  function normalizeDesc(s) {
+    return (s || "")
+      .toLowerCase()
+      .replace(/[^a-z0-9\s]/g, " ")
+      .replace(/\b\d{4,}\b/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  // Jaccard similarity over word tokens — cheap, dependency-free, and good
+  // enough to tell "UBER *TRIP HELP.UBER.COM" apart from "UBER EATS".
+  function descSimilarity(a, b) {
+    const na = normalizeDesc(a), nb = normalizeDesc(b);
+    if (!na || !nb) return 0;
+    if (na === nb) return 1;
+    const setA = new Set(na.split(" ").filter(Boolean));
+    const setB = new Set(nb.split(" ").filter(Boolean));
+    if (setA.size === 0 || setB.size === 0) return 0;
+    let inter = 0;
+    setA.forEach(w => { if (setB.has(w)) inter++; });
+    const union = new Set([...setA, ...setB]).size;
+    return union === 0 ? 0 : inter / union;
+  }
+
+  function daysBetween(d1, d2) {
+    const t1 = new Date(d1).getTime(), t2 = new Date(d2).getTime();
+    if (isNaN(t1) || isNaN(t2)) return Infinity;
+    return Math.abs(t1 - t2) / 86400000;
+  }
+
+  // Looks for the best-matching candidate for `row` among `candidates`
+  // ({date, amount, currency, description}). Same amount (currency-aware,
+  // small tolerance for rounding) is required either way; date and
+  // description similarity determine confidence:
+  //   "exact"    — same day, and descriptions clearly refer to the same thing
+  //   "possible" — within a few days (statements often show the post date on
+  //                one export and the transaction date on another) with at
+  //                least some descriptive overlap
+  function findDuplicateMatch(row, candidates) {
+    const rowAmount = Number(row.amount);
+    if (!rowAmount) return null;
+    const rowCcy = row.currency || "INR";
+    let best = null;
+    for (const c of candidates) {
+      const cAmount = Number(c.amount);
+      if (!cAmount) continue;
+      if ((c.currency || "INR") !== rowCcy) continue;
+      const tolerance = Math.max(0.01, Math.abs(rowAmount) * 0.001);
+      if (Math.abs(cAmount - rowAmount) > tolerance) continue;
+      const dayGap = daysBetween(c.date, row.date);
+      if (dayGap > 3) continue;
+      const sim = descSimilarity(c.description, row.description);
+      if (dayGap === 0 && sim >= 0.4) {
+        return { confidence: "exact", dayGap, sim, ref: c };
+      }
+      if (dayGap <= 3 && sim >= 0.25) {
+        if (!best || sim > best.sim) best = { confidence: "possible", dayGap, sim, ref: c };
+      }
+    }
+    return best;
+  }
+
+  // Flags each freshly-parsed row as a likely duplicate of either (a) a
+  // transaction already saved in the tracker, or (b) an earlier row in this
+  // same import batch — which is exactly what happens when a user uploads
+  // two statements whose date ranges overlap, or a statement that contains
+  // a repeated line. Exact matches are auto-unchecked; possible matches are
+  // left selectable but visibly flagged so the user makes the call.
+  function annotateDuplicates(rows) {
+    const existingCandidates = transactions.map(t => ({
+      date: t.date,
+      amount: Number(t.origAmount ?? t.amount),
+      currency: t.currency || "INR",
+      description: t.description || "",
+    }));
+
+    const out = [];
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i];
+      let match = findDuplicateMatch(row, existingCandidates);
+      let source = "existing";
+      if (!match) {
+        // Only look back at rows already processed in this batch, so the
+        // first occurrence of a transaction stays clean and only the
+        // repeat(s) get flagged.
+        const batchCandidates = out.slice(0, i).map(r => ({
+          date: r.date, amount: Number(r.amount), currency: r.currency, description: r.description,
+        }));
+        match = findDuplicateMatch(row, batchCandidates);
+        source = "batch";
+      }
+      if (match) {
+        out.push({
+          ...row,
+          _dupStatus: match.confidence, // "exact" | "possible"
+          _dupSource: source, // "existing" | "batch"
+          _dupInfo: match,
+          _selected: match.confidence === "exact" ? false : row._selected,
+        });
+      } else {
+        out.push(row);
+      }
+    }
+    return out;
+  }
+
+  function dupTooltip(r) {
+    if (!r._dupInfo) return "";
+    const { ref, dayGap } = r._dupInfo;
+    const where = r._dupSource === "existing" ? "an existing transaction" : "another row in this import";
+    const dateNote = dayGap > 0 ? ` (${Math.round(dayGap)} day${dayGap >= 1.5 ? "s" : ""} apart)` : "";
+    return `Looks like a duplicate of ${where}: ${ref.date}${dateNote}, ${ref.description || "no description"}, ${Number(ref.amount).toLocaleString()} ${ref.currency || ""}`;
+  }
+
   function handleImportFile(e) {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -1020,7 +1138,7 @@ export default function App() {
         showToast("Couldn't parse this CSV — check format");
         setImportPreview(null);
       } else {
-        setImportPreview(parsed);
+        setImportPreview(annotateDuplicates(parsed));
       }
     };
     reader.readAsText(file);
@@ -1081,7 +1199,7 @@ export default function App() {
       }
 
       setPdfDetectedCurrency(result.detectedCurrency);
-      setImportPreview(result.rows);
+      setImportPreview(annotateDuplicates(result.rows));
       setShowImport(true);
     } catch (err) {
       setPdfParseError(err.message || "Failed to parse PDF");
@@ -2153,6 +2271,32 @@ export default function App() {
                     <div style={{ fontSize: 13, color: MUTED, marginBottom: 10 }}>
                       Found <strong>{importPreview.length}</strong> transactions. Uncheck any to skip, and adjust type/category/currency as needed.
                     </div>
+                    {(() => {
+                      const exactCount = importPreview.filter(r => r._dupStatus === "exact").length;
+                      const possibleCount = importPreview.filter(r => r._dupStatus === "possible").length;
+                      if (exactCount === 0 && possibleCount === 0) return null;
+                      return (
+                        <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 14px", background: "#fdf6ec", border: "1px solid #e6d3ac", borderRadius: 8, marginBottom: 12, fontSize: 13, flexWrap: "wrap" }}>
+                          <span>
+                            ⚠️ {exactCount > 0 && <>Found <strong>{exactCount}</strong> likely duplicate{exactCount === 1 ? "" : "s"} of transactions already in your tracker (or repeated in this file) — unchecked automatically. </>}
+                            {possibleCount > 0 && <>Flagged <strong>{possibleCount}</strong> possible duplicate{possibleCount === 1 ? "" : "s"} (close date/amount match) for you to review. </>}
+                            This often happens when statement date ranges overlap.
+                          </span>
+                          <div style={{ display: "flex", gap: 6, marginLeft: "auto" }}>
+                            <button
+                              className="btn-ghost"
+                              style={{ fontSize: 12, padding: "4px 10px" }}
+                              onClick={() => setImportPreview(prev => prev.map(r => r._dupStatus ? { ...r, _selected: false } : r))}
+                            >Uncheck all flagged</button>
+                            <button
+                              className="btn-ghost"
+                              style={{ fontSize: 12, padding: "4px 10px" }}
+                              onClick={() => setImportPreview(prev => prev.map(r => r._dupStatus ? { ...r, _selected: true } : r))}
+                            >Import anyway</button>
+                          </div>
+                        </div>
+                      );
+                    })()}
                     <div className="scroll-x">
                       <table>
                         <thead>
@@ -2168,7 +2312,7 @@ export default function App() {
                         </thead>
                         <tbody>
                           {importPreview.map(r => (
-                            <tr key={r.id} style={{ opacity: r._selected ? 1 : 0.45 }}>
+                            <tr key={r.id} style={{ opacity: r._selected ? 1 : 0.45, background: r._dupStatus === "exact" ? "#fdf0ef" : r._dupStatus === "possible" ? "#fdf6ec" : "transparent" }}>
                               <td style={{ textAlign: "left" }}>
                                 <input type="checkbox" checked={r._selected} onChange={() => toggleImportRow(r.id)} />
                               </td>
@@ -2176,7 +2320,19 @@ export default function App() {
                                 <input className="num-input" type="date" style={{ width: 130 }} value={r.date} onChange={e => updateImportRow(r.id, "date", e.target.value)} />
                               </td>
                               <td style={{ textAlign: "left", maxWidth: 220 }}>
-                                <input className="num-input" value={r.description} onChange={e => updateImportRow(r.id, "description", e.target.value)} />
+                                <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                                  <input className="num-input" value={r.description} onChange={e => updateImportRow(r.id, "description", e.target.value)} />
+                                  {r._dupStatus && (
+                                    <span
+                                      title={dupTooltip(r)}
+                                      style={{
+                                        flexShrink: 0, fontSize: 11, fontWeight: 700, padding: "2px 6px", borderRadius: 5, cursor: "help",
+                                        color: r._dupStatus === "exact" ? "#8b3a35" : "#8a6d23",
+                                        background: r._dupStatus === "exact" ? "#f5d9d6" : "#f2e2ba",
+                                      }}
+                                    >{r._dupStatus === "exact" ? "Duplicate" : "Possible dup"}</span>
+                                  )}
+                                </div>
                               </td>
                               <td style={{ textAlign: "left" }}>
                                 <select className="num-input" style={{ width: 100 }} value={r.type} onChange={e => updateImportRow(r.id, "type", e.target.value)}>
