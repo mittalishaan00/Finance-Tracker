@@ -24,7 +24,7 @@ import App from './App'
 import { supabase } from './supabase'
 
 export default function Root() {
-  const { user, loading, aal, encryptionKey } = useAuth()
+  const { user, loading, aal, encryptionKey, encryptionKeyRef } = useAuth()
 
   // Tracks which userId (or null for signed-out) window.storage is
   // currently configured for. Read directly during render -- not via a
@@ -35,12 +35,13 @@ export default function Root() {
   const storageReadyForCurrentUser = !loading && configuredForRef.current === currentUserId
   const [, forceRerender] = useState(0)
 
-  // The shim's get/set close over this ref rather than the encryptionKey
-  // value directly, so that unlocking (encryptionKey going from null to a
-  // real key) takes effect immediately without needing to recreate the
-  // shim or remount App.
-  const encryptionKeyRef = useRef(null)
-  useEffect(() => { encryptionKeyRef.current = encryptionKey }, [encryptionKey])
+  // NOTE: encryptionKeyRef comes from AuthContext, not a local ref kept
+  // in sync via useEffect here. That used to be the bug: an effect-based
+  // sync runs one render late relative to App's own mount effect (see
+  // the comment on AuthContext's setEncryptionKey for the full
+  // explanation). Reading the context's ref directly means it's already
+  // correct by the time App asks for it, no matter how the two
+  // components' effects get ordered.
 
   // Inject window.storage shim, scoped to the current user
   useEffect(() => {

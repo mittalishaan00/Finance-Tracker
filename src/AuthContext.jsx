@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useEffect, useState } from 'react'
+import React, { createContext, useContext, useEffect, useRef, useState } from 'react'
 import { supabase } from './supabase'
 import { generateSalt, deriveKey } from './crypto'
 
@@ -9,6 +9,10 @@ export function AuthProvider({ children }) {
   const [loading, setLoading] = useState(true)
   // In-memory only, never persisted -- see crypto.js for why.
   const [encryptionKey, setEncryptionKeyState] = useState(null)
+  // Mirrors encryptionKey, but updated synchronously (not via a useEffect)
+  // the instant setEncryptionKey is called -- see the long comment on
+  // setEncryptionKey below for why this matters.
+  const encryptionKeyRef = useRef(null)
   // 'aal1' | 'aal2' | null -- Supabase's current authenticator assurance
   // level. A user with a verified MFA factor sits at aal1 until they pass
   // a challenge, then aal2 for the rest of the session.
@@ -61,6 +65,7 @@ export function AuthProvider({ children }) {
     if (typeof window !== 'undefined') {
       window.storage = undefined
     }
+    encryptionKeyRef.current = null
     setEncryptionKeyState(null)
     setAal(null)
     await supabase?.auth.signOut()
@@ -87,7 +92,24 @@ export function AuthProvider({ children }) {
     return deriveKey(secret, salt)
   }
 
+  // THE FIX: this updates encryptionKeyRef.current synchronously, in the
+  // same function call that also updates React state -- not in a
+  // useEffect keyed on encryptionKey (which is what Root.jsx used to do).
+  // That distinction is the whole bug: an effect only runs *after* a
+  // render commits, and React runs a child component's effects before
+  // its parent's effects within that same commit. The moment
+  // encryptionKey flips from null to a real key, Root re-renders and, in
+  // that SAME commit, swaps <UnlockGate/> out for <App/>. App (the
+  // child) immediately tries to load data, reading whatever the ref
+  // holds right now -- but Root's own "sync the ref" effect (the
+  // parent's effect) hasn't run yet, so the ref was still null. Since
+  // real encrypted data exists in Supabase by the time this matters, the
+  // load fails outright instead of just being "empty" -- exactly the
+  // "Couldn't load your data" screen. Setting the ref here, as a plain
+  // synchronous assignment, means it's already correct before React even
+  // starts that render -- there's no window for the race to occur in.
   function setEncryptionKey(key) {
+    encryptionKeyRef.current = key
     setEncryptionKeyState(key)
   }
 
@@ -136,7 +158,7 @@ export function AuthProvider({ children }) {
   return (
     <AuthContext.Provider value={{
       user, loading, signInWithGoogle, signInWithEmail, signUpWithEmail, signOut,
-      encryptionKey, setEncryptionKey, deriveCandidateKey, updatePassword,
+      encryptionKey, encryptionKeyRef, setEncryptionKey, deriveCandidateKey, updatePassword,
       aal, refreshAal,
       mfaListFactors, mfaEnroll, mfaVerifyEnrollment, mfaUnenroll, mfaChallengeAndVerify,
     }}>
