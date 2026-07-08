@@ -3,19 +3,8 @@
  *
  * localStorage keys are scoped to userId so multiple users
  * on the same device never see each other's data.
- *
- * Encryption: both the Supabase row and the localStorage cache can hold
- * either a plain payload object (legacy, or encryption not yet set up)
- * or an encrypted envelope ({ __encrypted, iv, ciphertext }). Every
- * function here takes an optional `encryptionKey` (an in-memory-only
- * CryptoKey from crypto.js, supplied by AuthContext once the user has
- * unlocked their session) and encrypts/decrypts transparently around it.
- * If no key is supplied, behaviour is unchanged from before encryption
- * existed. See crypto.js for why the key never touches disk or the
- * network.
  */
 import { supabase } from './supabase'
-import { encryptPayload, decryptPayload, isEncryptedEnvelope } from './crypto'
 
 function localKey(userId) {
   return userId ? `finance-tracker-${userId}` : 'finance-tracker-anon'
@@ -54,41 +43,18 @@ async function fetchRow(userId) {
     .single()
 }
 
-// Reads the local cache and returns the plain (decrypted) object. If the
-// cached copy is encrypted and no key is available, it's unusable --
-// treated the same as "no cache", never returned as-is.
-async function readLocalCache(key, encryptionKey) {
-  try {
-    const raw = localStorage.getItem(key)
-    if (!raw) return null
-    const parsed = JSON.parse(raw)
-    if (isEncryptedEnvelope(parsed)) {
-      if (!encryptionKey) return null
-      const plain = await decryptPayload(encryptionKey, parsed)
-      return looksNonEmpty(plain) ? plain : null
-    }
-    return looksNonEmpty(parsed) ? parsed : null
-  } catch {
-    return null
-  }
-}
-
-async function writeLocalCache(key, payload, encryptionKey) {
-  try {
-    if (encryptionKey) {
-      const envelope = await encryptPayload(encryptionKey, payload)
-      localStorage.setItem(key, JSON.stringify(envelope))
-    } else {
-      localStorage.setItem(key, JSON.stringify(payload))
-    }
-  } catch (e) {
-    console.warn('localStorage save failed:', e.message)
-  }
-}
-
-export async function loadData(userId, encryptionKey) {
+export async function loadData(userId) {
   const key = localKey(userId)
   const knownNonEmpty = userId ? localStorage.getItem(hasDataFlagKey(userId)) === '1' : false
+
+  const readLocalCache = () => {
+    try {
+      const raw = localStorage.getItem(key)
+      if (!raw) return null
+      const parsed = JSON.parse(raw)
+      return looksNonEmpty(parsed) ? parsed : null
+    } catch { return null }
+  }
 
   if (supabase && userId) {
     // Make sure the client actually has a session matching this user
@@ -107,24 +73,9 @@ export async function loadData(userId, encryptionKey) {
         const { data, error } = await fetchRow(userId)
 
         if (!error && data?.data) {
-          let plain = data.data
-          if (isEncryptedEnvelope(plain)) {
-            if (!encryptionKey) {
-              // Real (encrypted) data exists but we have no key to open it
-              // with. Should not normally happen -- the app gates behind
-              // an unlock step first -- but if it does, fail loudly rather
-              // than ever falling through to blank state.
-              return { status: 'error', data: null, error: new Error('Encrypted data present but no encryption key available') }
-            }
-            try {
-              plain = await decryptPayload(encryptionKey, plain)
-            } catch {
-              return { status: 'error', data: null, error: new Error('Could not decrypt stored data — wrong password or passphrase') }
-            }
-          }
-          await writeLocalCache(key, plain, encryptionKey)
-          if (looksNonEmpty(plain)) localStorage.setItem(hasDataFlagKey(userId), '1')
-          return { status: 'ok', data: plain }
+          localStorage.setItem(key, JSON.stringify(data.data))
+          if (looksNonEmpty(data.data)) localStorage.setItem(hasDataFlagKey(userId), '1')
+          return { status: 'ok', data: data.data }
         }
 
         if (error && error.code === 'PGRST116') {
@@ -147,7 +98,7 @@ export async function loadData(userId, encryptionKey) {
     // the login-timing race: rather than trying to perfectly predict
     // whether "zero rows" means "new account" or "race," just prefer
     // real cached data over a network hiccup whenever we have it.
-    const cached = await readLocalCache(key, encryptionKey)
+    const cached = readLocalCache()
     if (cached) {
       return { status: 'ok', data: cached }
     }
@@ -167,13 +118,15 @@ export async function loadData(userId, encryptionKey) {
     return { status: 'empty', data: null }
   }
 
-  const cached = await readLocalCache(key, encryptionKey)
+  const cached = readLocalCache()
   return cached ? { status: 'ok', data: cached } : { status: 'empty', data: null }
 }
 
-export async function saveData(userId, payload, encryptionKey) {
+export async function saveData(userId, payload) {
   const key = localKey(userId)
-  await writeLocalCache(key, payload, encryptionKey)
+  try { localStorage.setItem(key, JSON.stringify(payload)) } catch (e) {
+    console.warn('localStorage save failed:', e.message)
+  }
 
   if (!userId) return
 
@@ -195,14 +148,9 @@ export async function saveData(userId, payload, encryptionKey) {
 
   if (supabase) {
     try {
-      // Encrypting here (rather than leaving it plaintext) means every
-      // save transparently migrates a legacy plaintext row to an
-      // encrypted one the moment a user has unlocked with a key -- no
-      // separate migration step needed.
-      const toWrite = encryptionKey ? await encryptPayload(encryptionKey, payload) : payload
       const { error } = await supabase
         .from('user_data')
-        .upsert({ user_id: userId, data: toWrite, updated_at: new Date().toISOString() })
+        .upsert({ user_id: userId, data: payload, updated_at: new Date().toISOString() })
       if (error) console.warn('Supabase save failed:', error.message)
     } catch (e) { console.warn('Supabase save failed:', e.message) }
   }
@@ -213,71 +161,4 @@ export async function saveData(userId, payload, encryptionKey) {
 // reset is possible without weakening the guard above.
 export function forgetKnownNonEmpty(userId) {
   if (userId) localStorage.removeItem(hasDataFlagKey(userId))
-}
-
-// Confirms a candidate key actually opens this account's existing data,
-// without committing to it. Used by the unlock screen so a wrong
-// password/passphrase is caught immediately with a clear error, instead
-// of silently producing a decrypt failure deeper in the app later.
-// Returns true when there's nothing to verify against yet (brand-new
-// account, or an existing row that isn't encrypted).
-export async function verifyKey(userId, encryptionKey) {
-  if (!supabase || !userId) return true
-  try {
-    const { data, error } = await fetchRow(userId)
-    if (error || !data?.data) return true
-    if (!isEncryptedEnvelope(data.data)) return true
-    await decryptPayload(encryptionKey, data.data)
-    return true
-  } catch {
-    return false
-  }
-}
-
-// Re-encrypts the account's stored row (and local cache) from oldKey to
-// newKey -- the whole point of a password/passphrase change, since the
-// derived key changes the moment the secret it's derived from changes.
-// Without this, changing a password silently orphans all previously
-// encrypted data: the next unlock attempt would derive a brand-new key
-// that can't open a row still encrypted under the old one.
-//
-// Deliberately does NOT touch Supabase Auth's password itself -- callers
-// are responsible for sequencing this alongside their own
-// auth.updateUser({ password }) call, and for deciding what to do if one
-// half succeeds and the other fails (see AuthContext usage).
-export async function reencryptData(userId, oldKey, newKey) {
-  if (!supabase || !userId) return { ok: false, error: new Error('Not available in offline mode') }
-  try {
-    const { data, error } = await fetchRow(userId)
-    if (error && error.code !== 'PGRST116') return { ok: false, error }
-
-    let plain = {}
-    if (data?.data) {
-      const raw = data.data
-      if (isEncryptedEnvelope(raw)) {
-        if (!oldKey) return { ok: false, error: new Error('Missing current encryption key') }
-        try {
-          plain = await decryptPayload(oldKey, raw)
-        } catch {
-          return { ok: false, error: new Error('Could not decrypt existing data with the current key') }
-        }
-      } else {
-        plain = raw // legacy plaintext row -- just carries forward as-is, now encrypted
-      }
-    } else {
-      // Nothing saved yet for this account -- nothing to migrate.
-      return { ok: true }
-    }
-
-    const envelope = await encryptPayload(newKey, plain)
-    const { error: upsertError } = await supabase
-      .from('user_data')
-      .upsert({ user_id: userId, data: envelope, updated_at: new Date().toISOString() })
-    if (upsertError) return { ok: false, error: upsertError }
-
-    await writeLocalCache(localKey(userId), plain, newKey)
-    return { ok: true }
-  } catch (e) {
-    return { ok: false, error: e }
-  }
 }
