@@ -1,22 +1,30 @@
 /**
  * Root.jsx
  *
- * - Auth gate
- * - Injects window.storage shim (user-scoped)
- * - Clears other users' cached data from localStorage on login
- * - Seeds owner data from ownerSeed.json on first login
+ * Gating order for a signed-in user:
+ *   1. Auth (LoginPage) — not signed in at all
+ *   2. MFA challenge (MfaChallengeGate) — signed in, but has a verified
+ *      TOTP factor and hasn't passed a challenge this session (aal1 -> aal2)
+ *   3. Unlock (UnlockGate) — signed in (and past MFA if applicable), but
+ *      the in-memory encryption key for this session hasn't been
+ *      derived/verified yet (e.g. right after a page refresh)
+ *   4. App
+ *
+ * Also injects window.storage (user- and key-scoped) and clears other
+ * users' cached data from localStorage on login.
  */
 
 import React, { useEffect, useRef, useState } from 'react'
 import { useAuth } from './AuthContext'
 import { loadData, saveData, clearOtherUsersCache } from './storage'
 import LoginPage from './LoginPage'
+import MfaChallengeGate from './MfaChallengeGate'
+import UnlockGate from './UnlockGate'
 import App from './App'
 import { supabase } from './supabase'
 
 export default function Root() {
-  const { user, loading } = useAuth()
-  const [seeding, setSeeding] = useState(false)
+  const { user, loading, aal, encryptionKey } = useAuth()
 
   // Tracks which userId (or null for signed-out) window.storage is
   // currently configured for. Read directly during render -- not via a
@@ -26,6 +34,13 @@ export default function Root() {
   const currentUserId = user?.id ?? null
   const storageReadyForCurrentUser = !loading && configuredForRef.current === currentUserId
   const [, forceRerender] = useState(0)
+
+  // The shim's get/set close over this ref rather than the encryptionKey
+  // value directly, so that unlocking (encryptionKey going from null to a
+  // real key) takes effect immediately without needing to recreate the
+  // shim or remount App.
+  const encryptionKeyRef = useRef(null)
+  useEffect(() => { encryptionKeyRef.current = encryptionKey }, [encryptionKey])
 
   // Inject window.storage shim, scoped to the current user
   useEffect(() => {
@@ -37,7 +52,7 @@ export default function Root() {
 
     window.storage = {
       async get(key) {
-        const result = await loadData(userId)
+        const result = await loadData(userId, encryptionKeyRef.current)
         return {
           key,
           value: result.data ? JSON.stringify(result.data) : null,
@@ -48,7 +63,7 @@ export default function Root() {
         const parsed = (() => {
           try { return JSON.parse(value) } catch { return value }
         })()
-        await saveData(userId, parsed)
+        await saveData(userId, parsed, encryptionKeyRef.current)
         return { key, value }
       },
       async delete(key) { return { key, deleted: true } },
@@ -63,41 +78,20 @@ export default function Root() {
     forceRerender(n => n + 1)
   }, [user, loading])
 
-  // On first login by the owner, seed personal data from ownerSeed.json
-  useEffect(() => {
-    if (!user || !supabase || !storageReadyForCurrentUser) return
-    const ownerEmail = import.meta.env.VITE_OWNER_EMAIL
-    if (!ownerEmail || user.email !== ownerEmail) return
-
-    ;(async () => {
-      const existing = await loadData(user.id)
-      if (existing.status === 'error') return // don't touch anything on a failed load
-      if (existing.data && existing.data.snapshots && existing.data.snapshots.length > 0) return
-      try {
-        const res = await fetch('/ownerSeed.json')
-        if (!res.ok) return
-        const seed = await res.json()
-        if (!seed || !seed.snapshots) return
-        setSeeding(true)
-        await saveData(user.id, seed)
-        window.location.reload()
-      } catch (e) {
-        console.warn('Owner seed import failed:', e.message)
-        setSeeding(false)
-      }
-    })()
-  }, [user, storageReadyForCurrentUser])
-
-  if (loading || !storageReadyForCurrentUser || seeding) {
+  if (loading || !storageReadyForCurrentUser) {
     return (
       <div style={{ minHeight: '100vh', background: '#fbf8f4', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', fontFamily: 'system-ui', color: '#8a8178', fontSize: 14, gap: 12 }}>
-        <div>{seeding ? 'Importing your data…' : 'Loading…'}</div>
-        {seeding && <div style={{ fontSize: 12 }}>This only happens once on first login.</div>}
+        <div>Loading…</div>
       </div>
     )
   }
 
   if (supabase && !user) return <LoginPage />
+
+  const mfaPending = aal && aal.nextLevel === 'aal2' && aal.currentLevel !== 'aal2'
+  if (supabase && user && mfaPending) return <MfaChallengeGate />
+
+  if (supabase && user && !encryptionKey) return <UnlockGate />
 
   // key forces a full unmount/remount of App whenever the logged-in
   // user changes, so no in-memory state (snapshots, transactions,
