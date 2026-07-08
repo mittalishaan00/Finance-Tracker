@@ -1,6 +1,7 @@
 import React, { useState } from 'react'
 import { useAuth } from './AuthContext'
 import { supabase } from './supabase'
+import { verifyKey } from './storage'
 
 const ACCENT = '#c97c5d'
 const INK = '#2b2620'
@@ -9,7 +10,7 @@ const BORDER = '#e8e2d8'
 const BG = '#fbf8f4'
 
 export default function LoginPage() {
-  const { signInWithGoogle, signInWithEmail, signUpWithEmail } = useAuth()
+  const { signInWithGoogle, signInWithEmail, signUpWithEmail, deriveCandidateKey, setEncryptionKey } = useAuth()
   const [mode, setMode] = useState('signin')
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
@@ -24,12 +25,33 @@ export default function LoginPage() {
     setLoading(true)
     try {
       if (mode === 'signup') {
-        const { error } = await signUpWithEmail(email, password)
+        const { data, error } = await signUpWithEmail(email, password)
         if (error) throw error
-        setSuccess('Account created! Check your email for a confirmation link, or sign in directly if confirmations are disabled.')
+        if (data?.session && data?.user) {
+          // Email confirmations are off, or none required — we have a
+          // live session already. Derive the encryption key right away
+          // from the password the user just chose, so they land in the
+          // app already unlocked instead of hitting the unlock screen.
+          const key = await deriveCandidateKey(password)
+          setEncryptionKey(key) // brand-new account: nothing to verify against yet
+        } else {
+          setSuccess('Account created! Check your email for a confirmation link, or sign in directly if confirmations are disabled.')
+        }
       } else {
-        const { error } = await signInWithEmail(email, password)
+        const { data, error } = await signInWithEmail(email, password)
         if (error) throw error
+        if (data?.user) {
+          const key = await deriveCandidateKey(password)
+          const ok = await verifyKey(data.user.id, key)
+          if (ok) {
+            setEncryptionKey(key)
+          }
+          // If verification fails here (extremely unlikely right after a
+          // successful password sign-in — would mean the account's
+          // password was changed outside this app after data was
+          // encrypted), fall through without setting the key; the
+          // post-login Unlock screen will catch it and let the user retry.
+        }
       }
     } catch (err) {
       setError(err.message)

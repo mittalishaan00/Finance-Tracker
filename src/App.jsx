@@ -2,19 +2,15 @@ import { useAuth } from "./AuthContext"
 import React, { useState, useEffect, useMemo } from "react";
 import { LineChart, Line, AreaChart, Area, PieChart, Pie, Cell, BarChart, Bar, ComposedChart, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from "recharts";
 import * as XLSX from "xlsx";
+import SecuritySettings from "./SecuritySettings";
 
 // ---------- Seed data ----------
-// NOTE: This used to contain real, hardcoded personal net-worth figures.
-// That data is bundled into the client-side JS and shipped to every visitor
-// of the site (logged in or not) -- a serious data exposure on a public
-// Vercel deployment. It has been removed. New accounts now start empty;
-// each user's real data lives only in their own Supabase row (RLS-protected)
-// and is loaded at runtime via window.storage, never compiled into source.
-const SEED_DATES = [];
-const SEED_CATEGORIES = [];
-const SEED_VALUES = {};
-const ASSET_CLASS_MAP = {};
-const COST_BASIS = {};
+// This app previously pre-loaded one specific account ("the owner") with
+// hardcoded personal net-worth figures on every fresh session, and had a
+// companion mechanism in Root.jsx that fetched a personal ownerSeed.json
+// file for that same email on first login. Both are gone: every account,
+// including the original owner's, now starts empty and loads only its own
+// row from Supabase (RLS-protected), same as any other user.
 
 const DEFAULT_INCOME_CATEGORIES = ["Salary", "Bonus", "Dividends", "Interest", "Rental Income", "Other Income"];
 const DEFAULT_EXPENSE_CATEGORIES = ["Rent", "Groceries", "Utilities", "Travel", "Dining", "Shopping", "Healthcare", "Insurance", "Investment Fees", "Other Expense"];
@@ -129,22 +125,11 @@ const CATKEY = "networth-categories";
 
 export default function App() {
   const { user, signOut } = useAuth()
-  // Only pre-load seed data for the owner account.
-  const isOwner = !user || user?.email === import.meta.env.VITE_OWNER_EMAIL;
 
-  const [categories, setCategories] = useState(isOwner ? SEED_CATEGORIES : []);
-  const [snapshots, setSnapshots] = useState(() =>
-    isOwner
-      ? SEED_DATES.map((date, i) => ({
-          id: "seed-" + i,
-          date,
-          values: Object.fromEntries(SEED_CATEGORIES.map(c => [c, SEED_VALUES[c][i]])),
-          fxRates: { ...DEFAULT_FX_TO_INR },
-        }))
-      : []
-  );
-  const [costBasis, setCostBasis] = useState(isOwner ? COST_BASIS : {});
-  const [classMap, setClassMap] = useState(isOwner ? ASSET_CLASS_MAP : {});
+  const [categories, setCategories] = useState([]);
+  const [snapshots, setSnapshots] = useState([]);
+  const [costBasis, setCostBasis] = useState({});
+  const [classMap, setClassMap] = useState({});
   const [transactions, setTransactions] = useState([]); // {id, date, type: 'income'|'expense', category, description, amount}
   const [displayCurrency, setDisplayCurrency] = useState("INR");
   const [fxRates, setFxRates] = useState(DEFAULT_FX_TO_INR); // 1 unit of currency = X INR
@@ -1850,6 +1835,7 @@ export default function App() {
           ["budget", "Budget"],
           ["data", "Edit Data"],
           ["categories", "Categories"],
+          ["security", "Security"],
         ].map(([key, label]) => (
           <button key={key} className={"tab-btn" + (tab === key ? " active" : "")} onClick={() => setTab(key)}>{label}</button>
         ))}
@@ -3085,6 +3071,10 @@ export default function App() {
             />
 
           </div>
+        )}
+
+        {tab === "security" && (
+          <SecuritySettings />
         )}
       </main>
 
