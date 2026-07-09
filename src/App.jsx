@@ -172,24 +172,69 @@ function parseFlexDate(s) {
 
 
 // cashflows: array of {date: Date, amount: number} (negative = outflow/investment, positive = inflow/return)
+//
+// Rewritten after producing a ~196,000,000,000,000% result on a real
+// portfolio: the old version ran Newton-Raphson for up to 100 iterations
+// and just returned whatever `rate` it landed on, with no check that it
+// had actually converged. When cash flows include a large single swing
+// (e.g. net worth dropping ~99%), the derivative can go near-zero for a
+// step or two, and an unclamped Newton step then flings the guess out to
+// an enormous but technically-finite number that never recovers — which
+// is exactly what got displayed as the XIRR.
 function xirr(cashflows, guess = 0.1) {
   if (cashflows.length < 2) return null;
   const t0 = cashflows[0].date.getTime();
   const years = cashflows.map(cf => (cf.date.getTime() - t0) / (365 * 24 * 3600 * 1000));
   const npv = (rate) => cashflows.reduce((sum, cf, i) => sum + cf.amount / Math.pow(1 + rate, years[i]), 0);
   const dnpv = (rate) => cashflows.reduce((sum, cf, i) => sum - years[i] * cf.amount / Math.pow(1 + rate, years[i] + 1), 0);
-  let rate = guess;
-  for (let i = 0; i < 100; i++) {
-    const f = npv(rate);
-    const df = dnpv(rate);
-    if (Math.abs(df) < 1e-10) break;
-    const newRate = rate - f / df;
-    if (!isFinite(newRate)) break;
-    if (Math.abs(newRate - rate) < 1e-7) { rate = newRate; break; }
-    rate = newRate;
-    if (rate < -0.99) rate = -0.99;
+
+  // Convergence has to be judged relative to the size of the cash flows —
+  // "npv within 1e-7 of zero" is meaningless for a portfolio in the
+  // hundreds of thousands, so scale the tolerance to the largest flow.
+  const scale = Math.max(1, ...cashflows.map(cf => Math.abs(cf.amount)));
+  const converged = (rate) => isFinite(rate) && Math.abs(npv(rate)) / scale < 1e-7;
+
+  function newtonFrom(startRate) {
+    let rate = startRate;
+    for (let i = 0; i < 100; i++) {
+      const f = npv(rate);
+      const df = dnpv(rate);
+      if (Math.abs(df) < 1e-10) return converged(rate) ? rate : null;
+      let newRate = rate - f / df;
+      if (!isFinite(newRate)) return null;
+      // Clamp every step to a sane range (-99.99% .. +10,000% annualised)
+      // so a flat spot in the derivative can't launch the guess into
+      // outer space before the next iteration has a chance to correct it.
+      newRate = Math.max(-0.9999, Math.min(newRate, 100));
+      if (Math.abs(newRate - rate) < 1e-9) return converged(newRate) ? newRate : null;
+      rate = newRate;
+    }
+    return converged(rate) ? rate : null;
   }
-  return rate;
+
+  // A single fixed starting guess (0.1) can diverge for cash-flow
+  // patterns with a large swing in them, so retry from a spread of
+  // starting points and take the first one that actually converges.
+  for (const g of [guess, 0, 0.5, -0.5, 1, -0.9]) {
+    const r = newtonFrom(g);
+    if (r !== null) return r;
+  }
+
+  // Last resort: bisection over the same bounded range. NPV(rate) is
+  // monotonically decreasing for a standard "invest then return" flow
+  // pattern, so a sign change across the range guarantees a root.
+  let lo = -0.9999, hi = 100;
+  let fLo = npv(lo), fHi = npv(hi);
+  if (Math.abs(fLo) / scale < 1e-7) return lo;
+  if (Math.abs(fHi) / scale < 1e-7) return hi;
+  if ((fLo > 0) === (fHi > 0)) return null; // no sign change in range — can't isolate a root
+  for (let i = 0; i < 200; i++) {
+    const mid = (lo + hi) / 2;
+    const fMid = npv(mid);
+    if (Math.abs(fMid) / scale < 1e-7) return mid;
+    if ((fMid > 0) === (fLo > 0)) { lo = mid; fLo = fMid; } else { hi = mid; }
+  }
+  return (lo + hi) / 2;
 }
 
 const STORAGE_KEY = "networth-snapshots";
@@ -2137,7 +2182,7 @@ export default function App() {
             <div className="grid-stats" style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 14 }}>
               <StatCard label="Current Net Worth" value={fmtDispCompact(latestTotal)} />
               <StatCard label="Cumulative Savings" value={fmtDispCompact(cumulativeSavings)} positive={cumulativeSavings >= 0} sub="income − expenses" />
-              <StatCard label="Wealth Created" value={wealthCreated !== null ? fmtDispCompact(wealthCreated) : "—"} positive={wealthCreated === null || wealthCreated >= 0} sub={wealthCreated !== null ? "returns above savings" : "add another net worth entry"} />
+              <StatCard label="Wealth Created" value={wealthCreated !== null ? fmtDispCompact(wealthCreated) : "—"} positive={wealthCreated === null || wealthCreated >= 0} sub={wealthCreated !== null ? `vs your ${sortedSnapshots[0]?.date} entry` : "add another net worth entry"} />
               <StatCard label="Savings Rate" value={totalIncome > 0 ? ((netCashFlow / totalIncome) * 100).toFixed(1) + "%" : "—"} positive={netCashFlow >= 0} sub="of total income" />
               <StatCard label={`XIRR (${displayCurrency})`} value={xirrResult !== null ? (xirrResult * 100).toFixed(1) + "%" : "—"} positive={xirrResult === null || xirrResult >= 0} sub="annualised, currency-adjusted" />
             </div>
