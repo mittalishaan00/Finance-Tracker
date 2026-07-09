@@ -206,6 +206,7 @@ export default function App() {
   const [showAddCat, setShowAddCat] = useState(false);
   const [newCatName, setNewCatName] = useState("");
   const [newCatClass, setNewCatClass] = useState("Equity");
+  const [renamingCat, setRenamingCat] = useState(null); // {name, draft} — holding being renamed
   const [toast, setToast] = useState(null);
   const [txForm, setTxForm] = useState({ date: new Date().toISOString().slice(0,10), type: "income", category: "Salary", description: "", amount: "", currency: "INR" });
   const [editingTx, setEditingTx] = useState(null);
@@ -1570,10 +1571,6 @@ export default function App() {
     setTimeout(() => setToast(null), 1800);
   }
 
-  function updateSnapshotValue(id, cat, val) {
-    setSnapshots(prev => prev.map(s => s.id === id ? { ...s, values: { ...s.values, [cat]: val === "" ? "" : Number(val) } } : s));
-  }
-
   function updateSnapshotFx(id, code, val) {
     setSnapshots(prev => prev.map(s => s.id === id ? { ...s, fxRates: { ...(s.fxRates || DEFAULT_FX_TO_INR), [code]: val === "" ? "" : Number(val) } } : s));
   }
@@ -1591,8 +1588,10 @@ export default function App() {
     const newId = "s-" + Date.now();
     const baseValues = latest ? { ...latest.values } : Object.fromEntries(categories.map(c => [c, 0]));
     const baseFx = latest?.fxRates ? { ...latest.fxRates } : { ...fxRates };
+    const baseCurrencies = latest?.valueCurrencies ? { ...latest.valueCurrencies } : {};
+    const baseAmounts = latest?.valueAmounts ? { ...latest.valueAmounts } : { ...baseValues };
     const today = new Date().toISOString().slice(0, 10);
-    setSnapshots(prev => [...prev, { id: newId, date: today, values: baseValues, fxRates: baseFx }]);
+    setSnapshots(prev => [...prev, { id: newId, date: today, values: baseValues, fxRates: baseFx, valueCurrencies: baseCurrencies, valueAmounts: baseAmounts }]);
     setEditingSnap(newId);
     showToast("New entry added — edit values below");
   }
@@ -1742,13 +1741,37 @@ export default function App() {
     showToast("Category added");
   }
 
+  function renameCategory(oldName, newName) {
+    const trimmed = newName.trim();
+    if (!trimmed || trimmed === oldName) return;
+    if (categories.includes(trimmed)) { showToast("A holding with that name already exists"); return; }
+    const moveKey = (obj) => {
+      if (!obj || !(oldName in obj)) return obj;
+      const next = { ...obj };
+      next[trimmed] = next[oldName];
+      delete next[oldName];
+      return next;
+    };
+    setCategories(prev => prev.map(c => c === oldName ? trimmed : c));
+    setClassMap(prev => moveKey(prev));
+    setCostBasis(prev => moveKey(prev));
+    setSnapshots(prev => prev.map(s => ({
+      ...s,
+      values: moveKey(s.values),
+      valueAmounts: moveKey(s.valueAmounts),
+      valueCurrencies: moveKey(s.valueCurrencies),
+    })));
+    showToast(`Renamed to "${trimmed}"`);
+  }
+
   function removeCategory(cat) {
     if (!window.confirm) {} // no-op
     setCategories(prev => prev.filter(c => c !== cat));
     setSnapshots(prev => prev.map(s => {
-      const v = { ...s.values };
-      delete v[cat];
-      return { ...s, values: v };
+      const v = { ...s.values }; delete v[cat];
+      const a = { ...(s.valueAmounts || {}) }; delete a[cat];
+      const cur = { ...(s.valueCurrencies || {}) }; delete cur[cat];
+      return { ...s, values: v, valueAmounts: a, valueCurrencies: cur };
     }));
     showToast(`${cat} removed`);
   }
@@ -1759,6 +1782,46 @@ export default function App() {
 
   function updateClassMap(cat, cls) {
     setClassMap(prev => ({ ...prev, [cat]: cls }));
+  }
+
+  // ---- Net worth entries: per-holding entry currency ----
+  // Each holding's value is always stored in `values[cat]` as INR (the
+  // canonical unit everything else in the app already assumes), but it
+  // can be *entered* in USD or AED and converted automatically using that
+  // snapshot's fx rates, instead of requiring a manual conversion before
+  // typing it in. `valueAmounts`/`valueCurrencies` remember what was
+  // actually typed so re-editing shows the original number, not a
+  // rounded-trip INR conversion.
+  function updateSnapshotValue(id, cat, val) {
+    setSnapshots(prev => prev.map(s => {
+      if (s.id !== id) return s;
+      const currency = s.valueCurrencies?.[cat] || "INR";
+      const rate = currency === "INR" ? 1 : (s.fxRates?.[currency] || fxRates[currency] || DEFAULT_FX_TO_INR[currency] || 1);
+      const amt = val === "" ? "" : Number(val);
+      const inr = amt === "" ? "" : (currency === "INR" ? amt : amt * rate);
+      return {
+        ...s,
+        values: { ...s.values, [cat]: inr },
+        valueAmounts: { ...(s.valueAmounts || {}), [cat]: amt },
+      };
+    }));
+  }
+
+  function updateSnapshotValueCurrency(id, cat, newCurrency) {
+    setSnapshots(prev => prev.map(s => {
+      if (s.id !== id) return s;
+      const rate = newCurrency === "INR" ? 1 : (s.fxRates?.[newCurrency] || fxRates[newCurrency] || DEFAULT_FX_TO_INR[newCurrency] || 1);
+      const currentInr = Number(s.values[cat]) || 0;
+      // Switching currency re-interprets how you're entering the number;
+      // it doesn't change the holding's actual INR value, so back-convert
+      // to give a sensible starting figure in the new currency.
+      const amt = newCurrency === "INR" ? currentInr : Math.round((currentInr / rate) * 100) / 100;
+      return {
+        ...s,
+        valueCurrencies: { ...(s.valueCurrencies || {}), [cat]: newCurrency },
+        valueAmounts: { ...(s.valueAmounts || {}), [cat]: amt },
+      };
+    }));
   }
 
   if (loadError) {
@@ -2217,13 +2280,33 @@ export default function App() {
                             <input className="num-input" style={{ width: 120 }} value={s.date} onChange={e => updateSnapshotDate(s.id, e.target.value)} />
                           ) : s.date}
                         </td>
-                        {categories.map(c => (
+                        {categories.map(c => {
+                          const cur = s.valueCurrencies?.[c] || "INR";
+                          const rate = cur === "INR" ? 1 : (s.fxRates?.[cur] || fxRates[cur] || DEFAULT_FX_TO_INR[cur] || 1);
+                          return (
                           <td key={c}>
                             {isEditing ? (
-                              <input className="num-input" type="number" value={s.values[c] ?? ""} onChange={e => updateSnapshotValue(s.id, c, e.target.value)} />
+                              <div>
+                                <div style={{ display: "flex", gap: 3 }}>
+                                  <input className="num-input" type="number" style={{ width: 82 }}
+                                    value={s.valueAmounts?.[c] ?? s.values[c] ?? ""}
+                                    onChange={e => updateSnapshotValue(s.id, c, e.target.value)} />
+                                  <select className="num-input" style={{ width: 58, padding: "6px 2px", fontSize: 11 }}
+                                    value={cur}
+                                    onChange={e => updateSnapshotValueCurrency(s.id, c, e.target.value)}>
+                                    {Object.keys(CURRENCIES).map(code => <option key={code} value={code}>{code}</option>)}
+                                  </select>
+                                </div>
+                                {cur !== "INR" && (
+                                  <div style={{ fontSize: 10, color: MUTED, marginTop: 2 }}>
+                                    ≈ ₹{Math.round((Number(s.valueAmounts?.[c]) || 0) * rate).toLocaleString("en-IN")}
+                                  </div>
+                                )}
+                              </div>
                             ) : fmtCCAt(s.values[c], s.fxRates)}
                           </td>
-                        ))}
+                          );
+                        })}
                         <td style={{ fontWeight: 700, fontFamily: "'JetBrains Mono', monospace" }}>{fmtCCAt(total, s.fxRates)}</td>
                         <td>
                           {isEditing ? (
@@ -3166,18 +3249,46 @@ export default function App() {
                   </tr>
                 </thead>
                 <tbody>
-                  {categories.map(c => (
+                  {categories.map(c => {
+                    const isRenaming = renamingCat?.name === c;
+                    return (
                     <tr key={c}>
-                      <td style={{ fontWeight: 600 }}>{c}</td>
+                      <td style={{ fontWeight: 600 }}>
+                        {isRenaming ? (
+                          <input
+                            className="num-input" style={{ width: 180 }}
+                            value={renamingCat.draft}
+                            onChange={e => setRenamingCat(r => ({ ...r, draft: e.target.value }))}
+                            onKeyDown={e => {
+                              if (e.key === "Enter") { renameCategory(c, renamingCat.draft); setRenamingCat(null); }
+                              if (e.key === "Escape") setRenamingCat(null);
+                            }}
+                            autoFocus
+                          />
+                        ) : c}
+                      </td>
                       <td>
                         <select className="num-input" value={classMap[c] || "Other"} onChange={e => updateClassMap(c, e.target.value)}>
                           {assetClassOptions.map(o => <option key={o}>{o}</option>)}
                         </select>
                       </td>
                       <td>{fmtCCAt(latest?.values[c], latest?.fxRates)}</td>
-                      <td><button className="btn-icon" onClick={() => removeCategory(c)}>Remove</button></td>
+                      <td style={{ whiteSpace: "nowrap" }}>
+                        {isRenaming ? (
+                          <>
+                            <button className="btn-icon" style={{ color: "#5f8d6b", fontWeight: 600 }} onClick={() => { renameCategory(c, renamingCat.draft); setRenamingCat(null); }}>Save</button>
+                            <button className="btn-icon" onClick={() => setRenamingCat(null)}>Cancel</button>
+                          </>
+                        ) : (
+                          <>
+                            <button className="btn-icon" onClick={() => setRenamingCat({ name: c, draft: c })}>Rename</button>
+                            <button className="btn-icon" onClick={() => removeCategory(c)}>Remove</button>
+                          </>
+                        )}
+                      </td>
                     </tr>
-                  ))}
+                    );
+                  })}
                 </tbody>
               </table>
             </div>
