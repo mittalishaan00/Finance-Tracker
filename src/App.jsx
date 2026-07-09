@@ -13,12 +13,37 @@ import SecuritySettings from "./SecuritySettings";
 // row from Supabase (RLS-protected), same as any other user.
 
 const DEFAULT_INCOME_CATEGORIES = ["Salary", "Bonus", "Dividends", "Interest", "Rental Income", "Other Income"];
-const DEFAULT_EXPENSE_CATEGORIES = ["Rent", "Groceries", "Utilities", "Travel", "Dining", "Shopping", "Healthcare", "Insurance", "Investment Fees", "Other Expense"];
+// Standardized against what a typical individual actually tracks: added
+// Transport (daily commute/rideshare/fuel, distinct from Travel = trips),
+// Entertainment, and Subscriptions alongside the original set.
+const DEFAULT_EXPENSE_CATEGORIES = ["Rent", "Groceries", "Transport", "Utilities", "Dining", "Entertainment", "Travel", "Shopping", "Healthcare", "Insurance", "Subscriptions", "Investment Fees", "Other Expense"];
+// Any categories added to the standard set after a user's data already
+// existed get merged in (without touching anything they've customized)
+// — see the load effect below.
+const NEW_STANDARD_EXPENSE_CATEGORIES = ["Transport", "Entertainment", "Subscriptions"];
 // Keep these as constants for any place that needs the original defaults (e.g. fresh rule state)
 const INCOME_CATEGORIES = DEFAULT_INCOME_CATEGORIES;
 const EXPENSE_CATEGORIES = DEFAULT_EXPENSE_CATEGORIES;
 // Categories that are genuine consumption — all expense categories qualify
 const CONSUMPTION_CATEGORIES = new Set(EXPENSE_CATEGORIES);
+
+// Asset classes for net worth holdings. Added Debt, Real Estate, and
+// Gold/Commodities to the original set — these are common enough for an
+// individual's portfolio that they shouldn't require manually adding a
+// custom class first.
+const DEFAULT_ASSET_CLASSES = ["Equity", "FD", "Debt", "PF", "Bank A/C", "Real Estate", "Gold/Commodities", "Private Equity", "Other"];
+const NEW_STANDARD_ASSET_CLASSES = ["Debt", "Real Estate", "Gold/Commodities"];
+
+// A few common starter holdings, seeded (with zero balances) only for a
+// genuinely brand-new account — see the "empty" branch in the load
+// effect. These are just category labels, not financial data, so this
+// is unrelated to the old hardcoded-personal-numbers seed described
+// above; users can rename, delete, or add their own freely.
+const DEFAULT_STARTER_HOLDINGS = [
+  { name: "Equity", assetClass: "Equity" },
+  { name: "Fixed Deposit", assetClass: "FD" },
+  { name: "Debt", assetClass: "Debt" },
+];
 
 const COLORS = ["#c97c5d","#7c9885","#5b7c99","#d4a574","#9b6a6c","#6b8e9e","#b08968","#7a9b76","#a47551","#5e7a8c","#c4a35a"];
 const ACCENT = "#c97c5d";
@@ -159,6 +184,8 @@ export default function App() {
   // User-editable income/expense categories
   const [incomeCategories, setIncomeCategories] = useState(DEFAULT_INCOME_CATEGORIES);
   const [expenseCategories, setExpenseCategories] = useState(DEFAULT_EXPENSE_CATEGORIES);
+  // User-editable asset classes for net worth holdings (Equity, FD, Debt, etc.)
+  const [assetClassOptions, setAssetClassOptions] = useState(DEFAULT_ASSET_CLASSES);
   const [newTxCatName, setNewTxCatName] = useState("");
   const [newTxCatType, setNewTxCatType] = useState("expense");
   const [renamingTxCat, setRenamingTxCat] = useState(null); // {name, type, draft}
@@ -224,11 +251,33 @@ export default function App() {
           if (parsed.fxRates) setFxRates(parsed.fxRates);
           if (parsed.categoryRules) setCategoryRules(parsed.categoryRules);
           if (parsed.incomeCategories) setIncomeCategories(parsed.incomeCategories);
-          if (parsed.expenseCategories) setExpenseCategories(parsed.expenseCategories);
+          if (parsed.expenseCategories) {
+            // Merge in any standard categories added since this account's
+            // data was last saved (e.g. Transport), without disturbing
+            // anything the user has renamed, removed, or added themselves.
+            const merged = [...parsed.expenseCategories];
+            NEW_STANDARD_EXPENSE_CATEGORIES.forEach(c => { if (!merged.includes(c)) merged.push(c); });
+            setExpenseCategories(merged);
+          }
+          if (parsed.assetClassOptions) {
+            const merged = [...parsed.assetClassOptions];
+            NEW_STANDARD_ASSET_CLASSES.forEach(c => { if (!merged.includes(c)) merged.push(c); });
+            setAssetClassOptions(merged);
+          }
           if (parsed.budgets) setBudgets(parsed.budgets);
+        } else if (res.status === "empty") {
+          // Genuinely new account: seed a few common starter holdings
+          // (zero balance) so the Net Worth / Categories screens aren't
+          // blank. Just labels, not data -- freely renamable/removable.
+          setCategories(DEFAULT_STARTER_HOLDINGS.map(h => h.name));
+          const seedClassMap = {}, seedCostBasis = {};
+          DEFAULT_STARTER_HOLDINGS.forEach(h => { seedClassMap[h.name] = h.assetClass; seedCostBasis[h.name] = 0; });
+          setClassMap(seedClassMap);
+          setCostBasis(seedCostBasis);
         }
         // status === "empty" means a genuinely new account -- safe to
-        // continue with blank state and allow autosave to create the first row.
+        // continue with blank state (aside from the starter holdings
+        // seeded above) and allow autosave to create the first row.
         setLoaded(true);
       } catch (e) {
         // Corrupt data, a thrown error from window.storage, or anything
@@ -246,7 +295,7 @@ export default function App() {
     const save = async () => {
       setSaveStatus("saving");
       try {
-        const res = await window.storage.set("data", JSON.stringify({ snapshots, categories, costBasis, classMap, transactions, displayCurrency, fxRates, categoryRules, incomeCategories, expenseCategories, budgets }), false);
+        const res = await window.storage.set("data", JSON.stringify({ snapshots, categories, costBasis, classMap, transactions, displayCurrency, fxRates, categoryRules, incomeCategories, expenseCategories, assetClassOptions, budgets }), false);
         if (res === null) {
           setSaveStatus("error");
         } else {
@@ -258,11 +307,11 @@ export default function App() {
       }
     };
     save();
-  }, [snapshots, categories, costBasis, classMap, transactions, displayCurrency, fxRates, categoryRules, incomeCategories, expenseCategories, budgets, loaded]);
+  }, [snapshots, categories, costBasis, classMap, transactions, displayCurrency, fxRates, categoryRules, incomeCategories, expenseCategories, assetClassOptions, budgets, loaded]);
 
   // ---- Manual backup (export/import JSON) ----
   function exportBackup() {
-    const data = { snapshots, categories, costBasis, classMap, transactions, displayCurrency, fxRates, categoryRules, incomeCategories, expenseCategories, budgets, exportedAt: new Date().toISOString() };
+    const data = { snapshots, categories, costBasis, classMap, transactions, displayCurrency, fxRates, categoryRules, incomeCategories, expenseCategories, assetClassOptions, budgets, exportedAt: new Date().toISOString() };
     const json = JSON.stringify(data, null, 2);
     const filename = `networth-backup-${new Date().toISOString().slice(0,10)}.json`;
     try {
@@ -305,6 +354,7 @@ export default function App() {
         if (parsed.categoryRules) setCategoryRules(parsed.categoryRules);
         if (parsed.incomeCategories) setIncomeCategories(parsed.incomeCategories);
         if (parsed.expenseCategories) setExpenseCategories(parsed.expenseCategories);
+        if (parsed.assetClassOptions) setAssetClassOptions(parsed.assetClassOptions);
         showToast("Backup restored");
       } catch (err) {
         showToast("Couldn't read that file");
@@ -588,7 +638,8 @@ export default function App() {
       .sort((a, b) => b.value - a.value);
   }, [latest, categories, displayCurrency, fxRates]);
 
-  const assetClassOptions = ["Equity", "FD", "PF", "Bank A/C", "Private Equity", "Other"];
+  // assetClassOptions is now user-editable state (see useState above),
+  // seeded from DEFAULT_ASSET_CLASSES.
 
   // ---- XIRR-based return ----
   // ---- XIRR (savings-based, correct framework) ----
@@ -670,9 +721,72 @@ export default function App() {
     categories.reduce((s, c) => s + (Number(sortedSnapshots[0]?.values[c]) || 0), 0),
     sortedSnapshots[0]?.fxRates
   );
-  const wealthCreated = latestTotal - startingNwDisp - cumulativeSavings;
 
+  // ---- Wealth created: bounded to your net-worth tracking window ----
+  // Only transactions dated between your first and latest snapshot count
+  // towards a "growth between snapshots" comparison. Previously ALL
+  // transactions (even ones logged before you ever entered a net worth
+  // figure) were netted off against it, so a single fresh snapshot could
+  // show wealth created as -(everything you'd ever saved) — since the
+  // "starting" and "latest" points were literally the same snapshot, with
+  // no independent growth between them to measure, yet every bit of
+  // lifetime savings still got subtracted from it.
+  function sumSavingsBetween(startDateInclusive, endDateInclusive) {
+    return transactions.reduce((sum, t) => {
+      const d = new Date(t.date);
+      if (startDateInclusive && d < startDateInclusive) return sum;
+      if (endDateInclusive && d > endDateInclusive) return sum;
+      return sum + (t.type === "income" ? txDisplay(t) : -txDisplay(t));
+    }, 0);
+  }
 
+  const firstSnapDate = sortedSnapshots[0] ? parseFlexDate(sortedSnapshots[0].date) : null;
+  const lastSnapDate = sortedSnapshots.length ? parseFlexDate(sortedSnapshots[sortedSnapshots.length - 1].date) : null;
+  const prevSnapDate = previous ? parseFlexDate(previous.date) : null;
+  const dayAfter = (d) => new Date(d.getTime() + 24 * 3600 * 1000);
+
+  // All-time wealth created needs at least two snapshots to mean anything.
+  // With only one, "starting" and "latest" are the same data point by
+  // definition — show "—" rather than a misleading negative number.
+  const wealthCreated = sortedSnapshots.length >= 2
+    ? latestTotal - startingNwDisp - sumSavingsBetween(firstSnapDate, lastSnapDate)
+    : null;
+
+  // Since your last net worth entry: baseline is the *previous* snapshot
+  // rather than the very first one, and only savings logged since that
+  // snapshot count. This is the number requested to update cleanly every
+  // time a fresh net worth figure is entered, instead of staying anchored
+  // to month(s)-old history.
+  const wealthCreatedSinceLast = previous
+    ? latestTotal - prevTotalDisp - sumSavingsBetween(dayAfter(prevSnapDate), lastSnapDate)
+    : null;
+
+  const xirrSinceLast = useMemo(() => {
+    if (!previous) return null;
+    const startDate = parseFlexDate(previous.date);
+    const endDate = parseFlexDate(sortedSnapshots[sortedSnapshots.length - 1].date);
+    const flows = [{ date: startDate, amount: -prevTotalInr }];
+
+    const monthlyMap = {};
+    transactions.forEach(t => {
+      const d = new Date(t.date);
+      if (d <= startDate || d > endDate) return;
+      const m = t.date.slice(0, 7);
+      const rate = t.currency === "INR" ? 1 : (t.fxRateAtDate || t.fxRatesAtEntry?.[t.currency] || fxRates[t.currency] || 1);
+      const amtInr = (Number(t.origAmount ?? t.amount) || 0) * rate;
+      monthlyMap[m] = (monthlyMap[m] || 0) + (t.type === "income" ? amtInr : -amtInr);
+    });
+    Object.entries(monthlyMap).forEach(([ym, netSavings]) => {
+      const [y, m] = ym.split("-").map(Number);
+      flows.push({ date: new Date(y, m, 0), amount: -netSavings });
+    });
+    flows.push({ date: endDate, amount: latestTotalInr });
+    flows.sort((a, b) => a.date - b.date);
+
+    if (!flows.some(f => f.amount < 0) || !flows.some(f => f.amount > 0)) return null;
+    const rate = xirr(flows);
+    return isFinite(rate) && rate > -1 ? rate : null;
+  }, [previous, sortedSnapshots, transactions, prevTotalInr, latestTotalInr, fxRates]);
 
   // ---- Cash flow derived data ----
   const sortedTx = useMemo(() => {
@@ -858,13 +972,17 @@ export default function App() {
     setCategoryRules(prev => prev.map(r => r.id === id ? { ...r, [field]: value } : r));
   }
 
-  // ---- Transaction category management ----
+  // ---- Transaction / asset-class category management ----
+  // (type is "income", "expense", or "assetClass")
   function addTxCategory() {
     const name = newTxCatName.trim();
     if (!name) return;
     if (newTxCatType === "income") {
       if (incomeCategories.includes(name)) { showToast("Already exists"); return; }
       setIncomeCategories(prev => [...prev, name]);
+    } else if (newTxCatType === "assetClass") {
+      if (assetClassOptions.includes(name)) { showToast("Already exists"); return; }
+      setAssetClassOptions(prev => [...prev, name]);
     } else {
       if (expenseCategories.includes(name)) { showToast("Already exists"); return; }
       setExpenseCategories(prev => [...prev, name]);
@@ -876,6 +994,15 @@ export default function App() {
   function removeTxCategory(name, type) {
     if (type === "income") {
       setIncomeCategories(prev => prev.filter(c => c !== name));
+    } else if (type === "assetClass") {
+      if (name === "Other") { showToast('Can\'t remove "Other" — it\'s the fallback class'); return; }
+      setAssetClassOptions(prev => prev.filter(c => c !== name));
+      // Holdings classified under the removed asset class fall back to "Other"
+      setClassMap(prev => {
+        const next = { ...prev };
+        Object.keys(next).forEach(cat => { if (next[cat] === name) next[cat] = "Other"; });
+        return next;
+      });
     } else {
       setExpenseCategories(prev => prev.filter(c => c !== name));
     }
@@ -886,6 +1013,15 @@ export default function App() {
     if (!newName.trim() || newName === oldName) return;
     if (type === "income") {
       setIncomeCategories(prev => prev.map(c => c === oldName ? newName : c));
+    } else if (type === "assetClass") {
+      setAssetClassOptions(prev => prev.map(c => c === oldName ? newName : c));
+      setClassMap(prev => {
+        const next = { ...prev };
+        Object.keys(next).forEach(cat => { if (next[cat] === oldName) next[cat] = newName; });
+        return next;
+      });
+      showToast(`Renamed to "${newName}"`);
+      return;
     } else {
       setExpenseCategories(prev => prev.map(c => c === oldName ? newName : c));
     }
@@ -1849,10 +1985,24 @@ export default function App() {
             <div className="grid-stats" style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 14 }}>
               <StatCard label="Current Net Worth" value={fmtDispCompact(latestTotal)} />
               <StatCard label="Cumulative Savings" value={fmtDispCompact(cumulativeSavings)} positive={cumulativeSavings >= 0} sub="income − expenses" />
-              <StatCard label="Wealth Created" value={fmtDispCompact(wealthCreated)} positive={wealthCreated >= 0} sub="returns above savings" />
+              <StatCard label="Wealth Created" value={wealthCreated !== null ? fmtDispCompact(wealthCreated) : "—"} positive={wealthCreated === null || wealthCreated >= 0} sub={wealthCreated !== null ? "returns above savings" : "add another net worth entry"} />
               <StatCard label="Savings Rate" value={totalIncome > 0 ? ((netCashFlow / totalIncome) * 100).toFixed(1) + "%" : "—"} positive={netCashFlow >= 0} sub="of total income" />
               <StatCard label="XIRR" value={xirrResult !== null ? (xirrResult * 100).toFixed(1) + "%" : "—"} positive={xirrResult === null || xirrResult >= 0} sub="annualised, savings-based" />
             </div>
+
+            {previous && (
+              <div className="panel">
+                <PanelTitle noMargin>Since your last net worth entry</PanelTitle>
+                <p style={{ margin: "4px 0 14px", fontSize: 13, color: MUTED }}>
+                  Compares your latest snapshot ({sortedSnapshots[sortedSnapshots.length - 1].date}) against your previous one ({previous.date}), using only savings logged in between — so this updates cleanly every time you add a fresh entry, rather than staying anchored to your very first snapshot.
+                </p>
+                <div className="grid-stats" style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 14 }}>
+                  <StatCard label="Net Worth Change" value={fmtDispCompact(change)} positive={change >= 0} sub="vs previous entry" />
+                  <StatCard label="Wealth Created" value={wealthCreatedSinceLast !== null ? fmtDispCompact(wealthCreatedSinceLast) : "—"} positive={wealthCreatedSinceLast === null || wealthCreatedSinceLast >= 0} sub="returns above savings, since last entry" />
+                  <StatCard label="XIRR" value={xirrSinceLast !== null ? (xirrSinceLast * 100).toFixed(1) + "%" : "—"} positive={xirrSinceLast === null || xirrSinceLast >= 0} sub="annualised, since last entry" />
+                </div>
+              </div>
+            )}
 
             {/* Net worth over time */}
             <div className="panel">
@@ -2979,12 +3129,12 @@ export default function App() {
         {tab === "categories" && (
           <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
 
-            {/* ---- Asset categories ---- */}
+            {/* ---- Holdings ---- */}
             <div className="panel">
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
                 <div>
-                  <PanelTitle noMargin>Asset categories</PanelTitle>
-                  <p style={{ margin: "4px 0 0", fontSize: 13, color: MUTED }}>Holdings tracked in your net worth snapshots.</p>
+                  <PanelTitle noMargin>Holdings</PanelTitle>
+                  <p style={{ margin: "4px 0 0", fontSize: 13, color: MUTED }}>Individual accounts/holdings tracked in your net worth snapshots, grouped into asset classes below.</p>
                 </div>
                 <button className="btn-primary" onClick={() => setShowAddCat(v => !v)}>+ Add holding</button>
               </div>
@@ -3031,6 +3181,26 @@ export default function App() {
                 </tbody>
               </table>
             </div>
+
+            {/* ---- Asset classes ---- */}
+            <TxCategoryPanel
+              title="Asset classes"
+              subtitle="Groupings used in the asset-class breakdown chart (Equity, FD, Debt, Real Estate, etc). Removing one reassigns any holdings using it to “Other”."
+              type="assetClass"
+              cats={assetClassOptions}
+              renamingTxCat={renamingTxCat}
+              setRenamingTxCat={setRenamingTxCat}
+              newTxCatName={newTxCatName}
+              setNewTxCatName={setNewTxCatName}
+              newTxCatType={newTxCatType}
+              setNewTxCatType={setNewTxCatType}
+              addTxCategory={addTxCategory}
+              removeTxCategory={removeTxCategory}
+              renameTxCategory={renameTxCategory}
+              usageCount={name => categories.filter(c => (classMap[c] || "Other") === name).length}
+              usageLabel="holdings"
+              MUTED={MUTED} BORDER={BORDER}
+            />
 
             {/* ---- Income categories ---- */}
             <TxCategoryPanel
@@ -3120,10 +3290,10 @@ function PanelTitle({ children, noMargin }) {
   );
 }
 
-function TxCategoryPanel({ title, subtitle, type, cats, renamingTxCat, setRenamingTxCat, newTxCatName, setNewTxCatName, newTxCatType, setNewTxCatType, addTxCategory, removeTxCategory, renameTxCategory, usageCount, MUTED, BORDER }) {
+function TxCategoryPanel({ title, subtitle, type, cats, renamingTxCat, setRenamingTxCat, newTxCatName, setNewTxCatName, newTxCatType, setNewTxCatType, addTxCategory, removeTxCategory, renameTxCategory, usageCount, usageLabel = "transactions", MUTED, BORDER }) {
   const [showAdd, setShowAdd] = useState(false);
-  const accentColor = type === "income" ? "#5f8d6b" : "#b5685a";
-  const bgColor = type === "income" ? "#7c988514" : "#b5685a14";
+  const accentColor = type === "income" ? "#5f8d6b" : type === "assetClass" ? "#7a8ba6" : "#b5685a";
+  const bgColor = type === "income" ? "#7c988514" : type === "assetClass" ? "#7a8ba614" : "#b5685a14";
 
   return (
     <div className="panel">
@@ -3145,7 +3315,7 @@ function TxCategoryPanel({ title, subtitle, type, cats, renamingTxCat, setRenami
             <input
               className="num-input" style={{ width: 240 }} value={newTxCatName}
               onChange={e => setNewTxCatName(e.target.value)}
-              placeholder={type === "income" ? "e.g. Freelance" : "e.g. Pet Care"}
+              placeholder={type === "income" ? "e.g. Freelance" : type === "assetClass" ? "e.g. Crypto" : "e.g. Pet Care"}
               onKeyDown={e => { if (e.key === "Enter") { setNewTxCatType(type); addTxCategory(); setShowAdd(false); } }}
             />
           </div>
@@ -3161,7 +3331,7 @@ function TxCategoryPanel({ title, subtitle, type, cats, renamingTxCat, setRenami
         <thead>
           <tr>
             <th style={{ textAlign: "left" }}>Category</th>
-            <th>Transactions using this</th>
+            <th>{usageLabel === "holdings" ? "Holdings using this" : "Transactions using this"}</th>
             <th></th>
           </tr>
         </thead>
@@ -3192,7 +3362,7 @@ function TxCategoryPanel({ title, subtitle, type, cats, renamingTxCat, setRenami
                 </td>
                 <td>
                   <span style={{ fontSize: 11, padding: "2px 8px", borderRadius: 10, background: bgColor, color: accentColor, fontWeight: 600 }}>
-                    {count} {count === 1 ? "transaction" : "transactions"}
+                    {count} {count === 1 ? usageLabel.slice(0, -1) : usageLabel}
                   </span>
                 </td>
                 <td style={{ whiteSpace: "nowrap" }}>
@@ -3204,7 +3374,9 @@ function TxCategoryPanel({ title, subtitle, type, cats, renamingTxCat, setRenami
                   ) : (
                     <>
                       <button className="btn-icon" onClick={() => setRenamingTxCat({ name, type, draft: name })}>Rename</button>
-                      <button className="btn-icon" onClick={() => removeTxCategory(name, type)} title={count > 0 ? `${count} transactions use this category` : ""}>Remove</button>
+                      {!(type === "assetClass" && name === "Other") && (
+                        <button className="btn-icon" onClick={() => removeTxCategory(name, type)} title={count > 0 ? `${count} ${usageLabel} use this category` : ""}>Remove</button>
+                      )}
                     </>
                   )}
                 </td>
