@@ -62,23 +62,34 @@ const CURRENCIES = {
 const DEFAULT_FX_TO_INR = { INR: 1, USD: 95.3, AED: 25.9 };
 
 // ---------- Historical FX rates ----------
-// Monthly USD/INR averages from ECB/RBI data.
+// Monthly USD/INR averages, used as an OFFLINE FALLBACK when a live rate
+// can't be fetched (see fetchFrankfurterRate below, which is tried first).
 // AED is pegged to USD at exactly 3.6725, so AED/INR = USD/INR / 3.6725.
-// These are real historical monthly averages accurate to ±0.3 INR/USD.
+//
+// NOTE (corrected — previous table was significantly stale): the rupee
+// depreciated sharply through H2 2025 (US tariff announcement) and again
+// in Q2 2026 (Strait of Hormuz oil shock, record lows near 96.8), neither
+// of which the old hardcoded table reflected — it showed USD/INR flat or
+// even *falling* through those periods when it actually spiked. These
+// figures were rebuilt from public monthly-average data as of this
+// update; if you're seeing this much later, prefer the live fetch path.
 const HIST_USD_INR = {
   "2024-01": 83.1, "2024-02": 83.0, "2024-03": 83.3, "2024-04": 83.6,
   "2024-05": 83.5, "2024-06": 83.5, "2024-07": 83.7, "2024-08": 83.9,
   "2024-09": 83.8, "2024-10": 84.1, "2024-11": 84.5, "2024-12": 85.0,
-  "2025-01": 86.5, "2025-02": 86.9, "2025-03": 86.7, "2025-04": 85.5,
-  "2025-05": 84.5, "2025-06": 84.4, "2025-07": 83.8, "2025-08": 83.9,
-  "2025-09": 83.7, "2025-10": 83.9, "2025-11": 84.4, "2025-12": 85.0,
-  "2026-01": 86.4, "2026-02": 87.1, "2026-03": 86.5, "2026-04": 84.8,
-  "2026-05": 84.7, "2026-06": 85.2,
+  "2025-01": 85.5, "2025-02": 86.5, "2025-03": 85.8, "2025-04": 85.0,
+  "2025-05": 84.5, "2025-06": 85.5, "2025-07": 89.0, "2025-08": 90.0,
+  "2025-09": 89.3, "2025-10": 89.0, "2025-11": 89.6, "2025-12": 90.3,
+  "2026-01": 89.9, "2026-02": 90.5, "2026-03": 91.5, "2026-04": 89.5,
+  "2026-05": 94.5, "2026-06": 92.8, "2026-07": 95.3,
 };
 const AED_PER_USD = 3.6725; // fixed peg, never changes
 
 function historicalRate(date, currency) {
-  // Returns INR per 1 unit of currency for the given date
+  // Returns INR per 1 unit of currency for the given date, from the
+  // offline reference table. Prefer fetchFrankfurterRate() for a real
+  // live lookup; this is the synchronous fallback used when that isn't
+  // available (offline, or before a refresh has completed).
   if (!date || currency === "INR") return 1;
   const month = String(date).slice(0, 7); // "YYYY-MM"
   const usdInr = HIST_USD_INR[month] || DEFAULT_FX_TO_INR.USD;
@@ -87,10 +98,46 @@ function historicalRate(date, currency) {
   return DEFAULT_FX_TO_INR[currency] || 1; // fallback for unknown currencies
 }
 
-// These are kept as no-ops for backward compat but do nothing now
-const fxCache = new Map();
-async function fetchRatesBatch(pairs) { return {}; }
-async function fetchHistoricalRate(date, currency) { return historicalRate(date, currency); }
+// ---- Live historical rate lookup (Frankfurter — ECB reference rates) ----
+// Frankfurter (frankfurter.dev) is a free, no-key-required API built on
+// the European Central Bank's daily reference rates, and supports
+// CORS so it can be called directly from the browser. It does NOT cover
+// AED (ECB's reference basket doesn't include it), so AED/INR is always
+// derived from the fetched USD/INR rate via the fixed peg — same
+// approach as the offline table.
+//
+// This was previously advertised in the UI ("confirmed historical rates
+// from Frankfurter") but never actually called — `fetchHistoricalRate`
+// just returned the static table above. It now does what the label says,
+// and falls back to the table (labelled as an estimate) if the request
+// fails for any reason.
+const liveRateCache = new Map(); // "date|currency" -> INR rate, or null if unavailable
+async function fetchFrankfurterRate(date, currency) {
+  if (!date || currency === "INR") return 1;
+  const cacheKey = `${date}|${currency}`;
+  if (liveRateCache.has(cacheKey)) return liveRateCache.get(cacheKey);
+  const usdCode = currency === "AED" ? "USD" : currency;
+  try {
+    const res = await fetch(`https://api.frankfurter.dev/v1/${date}?from=${usdCode}&to=INR`);
+    if (!res.ok) throw new Error(`frankfurter ${res.status}`);
+    const data = await res.json();
+    const usdInr = data?.rates?.INR;
+    if (!usdInr || !isFinite(usdInr)) throw new Error("no INR rate in response");
+    const rate = currency === "AED" ? usdInr / AED_PER_USD : usdInr;
+    liveRateCache.set(cacheKey, rate);
+    return rate;
+  } catch (e) {
+    liveRateCache.set(cacheKey, null);
+    return null; // caller falls back to historicalRate()
+  }
+}
+
+async function fetchHistoricalRate(date, currency) {
+  const live = await fetchFrankfurterRate(date, currency);
+  return live !== null ? live : historicalRate(date, currency);
+}
+async function fetchRatesBatch(pairs) { return {}; } // kept for backward compat, unused
+
 
 function fmtMoney(n, currency, symbol) {
   if (n === undefined || n === null || isNaN(n)) return "—";
@@ -561,11 +608,15 @@ export default function App() {
     return (Number(t.origAmount ?? t.amount) || 0) * rate;
   };
 
-  // txDisplay(t): transaction amount in the current display currency
+  // txDisplay(t): transaction amount in the current display currency,
+  // converted using the rate AS OF the transaction's own date — not
+  // today's rate, which would otherwise silently distort old transactions
+  // every time the exchange rate moves (e.g. a Jan 2025 grocery run would
+  // keep changing in USD terms as USD/INR moves through 2026).
   const txDisplay = (t) => {
     if (displayCurrency === "INR") return txInr(t);
     if (t.currency === displayCurrency) return Number(t.origAmount ?? t.amount) || 0;
-    return txInr(t) / (fxRates[displayCurrency] || DEFAULT_FX_TO_INR[displayCurrency] || 1);
+    return txInr(t) / historicalRate(t.date, displayCurrency);
   };
 
   const fmtTx = (t) => fmtMoney(txDisplay(t), displayCurrency, cur.symbol);
@@ -653,25 +704,37 @@ export default function App() {
   //
   // "Investments" is intentionally excluded as an expense — it's just
   // reallocation of savings, already captured in the net worth snapshots.
+  //
+  // CURRENCY: this is computed in your selected display currency, not
+  // always INR. That matters — if your net worth is flat in INR terms but
+  // INR depreciates against (say) USD over the period, you've genuinely
+  // lost value in USD terms even though the INR-denominated XIRR would
+  // show ~0%. Each flow is converted using the rate as of ITS OWN date
+  // (the snapshot's recorded rate, or the transaction's historical rate),
+  // so FX movements between flow dates flow through into the result —
+  // switch the display currency to see the same portfolio's return
+  // measured in a different currency.
   const xirrResult = useMemo(() => {
     if (sortedSnapshots.length < 2) return null;
 
-    const flows = [];
+    const startSnap = sortedSnapshots[0];
+    const endSnap = sortedSnapshots[sortedSnapshots.length - 1];
+    const startDate = parseFlexDate(startSnap.date);
+    const endDate = parseFlexDate(endSnap.date);
+    const startTotalInr = categories.reduce((s, c) => s + (Number(startSnap.values[c]) || 0), 0);
 
-    // T0: starting net worth as outflow
-    const firstDate = parseFlexDate(sortedSnapshots[0].date);
-    const firstTotal = categories.reduce((s, c) => s + (Number(sortedSnapshots[0].values[c]) || 0), 0);
-    flows.push({ date: firstDate, amount: -firstTotal });
+    const flows = [{ date: startDate, amount: -convAt(startTotalInr, startSnap.fxRates) }];
 
-    // Aggregate monthly net savings from transactions (INR, all amounts stored in INR)
-    const monthlyMap = {}; // "YYYY-MM" -> net savings in INR
+    // Aggregate monthly net savings, bounded to the snapshot window and
+    // converted to display currency using each transaction's own date
+    // (txDisplay already does date-appropriate conversion).
+    const monthlyMap = {}; // "YYYY-MM" -> net savings in display currency
     transactions.forEach(t => {
+      const d = new Date(t.date);
+      if (d < startDate || d > endDate) return;
       const m = t.date.slice(0, 7);
-      if (!monthlyMap[m]) monthlyMap[m] = 0;
-      const rate = t.currency === "INR" ? 1 : (t.fxRateAtDate || t.fxRatesAtEntry?.[t.currency] || fxRates[t.currency] || 1);
-      const amtInr = (Number(t.origAmount ?? t.amount) || 0) * (t.currency === "INR" ? 1 : rate);
-      if (t.type === "income") monthlyMap[m] += amtInr;
-      else monthlyMap[m] -= amtInr;
+      const amtDisp = txDisplay(t);
+      monthlyMap[m] = (monthlyMap[m] || 0) + (t.type === "income" ? amtDisp : -amtDisp);
     });
 
     // Each month's net savings becomes a dated flow
@@ -685,8 +748,7 @@ export default function App() {
     });
 
     // Terminal: current net worth as inflow
-    const lastDate = parseFlexDate(sortedSnapshots[sortedSnapshots.length - 1].date);
-    flows.push({ date: lastDate, amount: latestTotalInr });
+    flows.push({ date: endDate, amount: latestTotal });
 
     // Sort by date and discard any flows before T0 (can't precede start)
     flows.sort((a, b) => a.date - b.date);
@@ -698,7 +760,7 @@ export default function App() {
 
     const rate = xirr(flows);
     return isFinite(rate) && rate > -1 ? rate : null;
-  }, [sortedSnapshots, categories, transactions, latestTotalInr]);
+  }, [sortedSnapshots, categories, transactions, latestTotal, displayCurrency, fxRates]);
 
   // Monthly net savings (for display — in display currency)
   const monthlySavings = useMemo(() => {
@@ -762,32 +824,33 @@ export default function App() {
     ? latestTotal - prevTotalDisp - sumSavingsBetween(dayAfter(prevSnapDate), lastSnapDate)
     : null;
 
+  // Same currency-awareness as xirrResult above — converted to display
+  // currency at each flow's own date, not left in INR.
   const xirrSinceLast = useMemo(() => {
     if (!previous) return null;
     const startDate = parseFlexDate(previous.date);
     const endDate = parseFlexDate(sortedSnapshots[sortedSnapshots.length - 1].date);
-    const flows = [{ date: startDate, amount: -prevTotalInr }];
+    const flows = [{ date: startDate, amount: -prevTotalDisp }];
 
     const monthlyMap = {};
     transactions.forEach(t => {
       const d = new Date(t.date);
       if (d <= startDate || d > endDate) return;
       const m = t.date.slice(0, 7);
-      const rate = t.currency === "INR" ? 1 : (t.fxRateAtDate || t.fxRatesAtEntry?.[t.currency] || fxRates[t.currency] || 1);
-      const amtInr = (Number(t.origAmount ?? t.amount) || 0) * rate;
-      monthlyMap[m] = (monthlyMap[m] || 0) + (t.type === "income" ? amtInr : -amtInr);
+      const amtDisp = txDisplay(t);
+      monthlyMap[m] = (monthlyMap[m] || 0) + (t.type === "income" ? amtDisp : -amtDisp);
     });
     Object.entries(monthlyMap).forEach(([ym, netSavings]) => {
       const [y, m] = ym.split("-").map(Number);
       flows.push({ date: new Date(y, m, 0), amount: -netSavings });
     });
-    flows.push({ date: endDate, amount: latestTotalInr });
+    flows.push({ date: endDate, amount: latestTotal });
     flows.sort((a, b) => a.date - b.date);
 
     if (!flows.some(f => f.amount < 0) || !flows.some(f => f.amount > 0)) return null;
     const rate = xirr(flows);
     return isFinite(rate) && rate > -1 ? rate : null;
-  }, [previous, sortedSnapshots, transactions, prevTotalInr, latestTotalInr, fxRates]);
+  }, [previous, sortedSnapshots, transactions, prevTotalDisp, latestTotal, displayCurrency, fxRates]);
 
   // ---- Cash flow derived data ----
   const sortedTx = useMemo(() => {
@@ -915,26 +978,42 @@ export default function App() {
     showToast("Transaction removed");
   }
 
-  function refreshHistoricalRates() {
+  async function refreshHistoricalRates() {
     const needsUpdate = transactions.filter(t =>
-      (t.currency || "INR") !== "INR" && t.fxRateSource !== "historical"
+      (t.currency || "INR") !== "INR" && t.fxRateSource !== "historical" && t.fxRateSource !== "frankfurter"
     );
     if (needsUpdate.length === 0) { showToast("All rates already up to date"); return; }
-    const updatedMap = {};
-    needsUpdate.forEach(t => {
-      updatedMap[t.id] = historicalRate(t.date, t.currency);
-    });
+    showToast(`Fetching rates for ${needsUpdate.length} transactions…`);
+
+    // Dedupe by date+currency so we don't hit the API once per transaction
+    const uniquePairs = [...new Set(needsUpdate.map(t => `${t.date}|${t.currency}`))];
+    const rateByPair = {};
+    await Promise.all(uniquePairs.map(async key => {
+      const [date, currency] = key.split("|");
+      const live = await fetchFrankfurterRate(date, currency);
+      rateByPair[key] = live !== null
+        ? { rate: live, source: "frankfurter" }
+        : { rate: historicalRate(date, currency), source: "historical" }; // offline table fallback
+    }));
+
+    let liveCount = 0, fallbackCount = 0;
     setTransactions(prev => prev.map(t => {
-      const newRate = updatedMap[t.id];
-      if (!newRate) return t;
+      if ((t.currency || "INR") === "INR" || t.fxRateSource === "historical" || t.fxRateSource === "frankfurter") return t;
+      const { rate, source } = rateByPair[`${t.date}|${t.currency}`] || {};
+      if (!rate) return t;
+      if (source === "frankfurter") liveCount++; else fallbackCount++;
       return {
         ...t,
-        fxRateAtDate: newRate,
-        fxRateSource: "historical",
-        amount: (Number(t.origAmount ?? t.amount) || 0) * newRate,
+        fxRateAtDate: rate,
+        fxRateSource: source,
+        amount: (Number(t.origAmount ?? t.amount) || 0) * rate,
       };
     }));
-    showToast(`Updated ${needsUpdate.length} transactions with historical rates`);
+    showToast(
+      fallbackCount > 0
+        ? `Updated ${liveCount + fallbackCount} — ${liveCount} live, ${fallbackCount} from offline table (couldn't reach Frankfurter)`
+        : `Updated ${liveCount} transactions with live historical rates`
+    );
   }
 
   // ---- Categorisation rules ----
@@ -1572,11 +1651,21 @@ export default function App() {
   }
 
   function updateSnapshotFx(id, code, val) {
-    setSnapshots(prev => prev.map(s => s.id === id ? { ...s, fxRates: { ...(s.fxRates || DEFAULT_FX_TO_INR), [code]: val === "" ? "" : Number(val) } } : s));
+    setSnapshots(prev => prev.map(s => s.id === id ? { ...s, fxRates: { ...(s.fxRates || DEFAULT_FX_TO_INR), [code]: val === "" ? "" : Number(val) }, fxRatesTouched: true } : s));
   }
 
   function updateSnapshotDate(id, date) {
-    setSnapshots(prev => prev.map(s => s.id === id ? { ...s, date } : s));
+    setSnapshots(prev => prev.map(s => {
+      if (s.id !== id) return s;
+      // Auto-refresh this entry's fx rates to match the new date's
+      // historical rate — unless the user has manually edited them
+      // already (fxRatesTouched), in which case we leave their numbers
+      // alone. Previously this always kept whatever rate was there
+      // (usually today's), so backdating an entry silently mismatched
+      // its date and its fx rate.
+      const fxRates = s.fxRatesTouched ? s.fxRates : { INR: 1, USD: historicalRate(date, "USD"), AED: historicalRate(date, "AED") };
+      return { ...s, date, fxRates };
+    }));
   }
 
   function deleteSnapshot(id) {
@@ -1587,11 +1676,11 @@ export default function App() {
   function addSnapshot() {
     const newId = "s-" + Date.now();
     const baseValues = latest ? { ...latest.values } : Object.fromEntries(categories.map(c => [c, 0]));
-    const baseFx = latest?.fxRates ? { ...latest.fxRates } : { ...fxRates };
+    const today = new Date().toISOString().slice(0, 10);
+    const baseFx = { INR: 1, USD: historicalRate(today, "USD"), AED: historicalRate(today, "AED") };
     const baseCurrencies = latest?.valueCurrencies ? { ...latest.valueCurrencies } : {};
     const baseAmounts = latest?.valueAmounts ? { ...latest.valueAmounts } : { ...baseValues };
-    const today = new Date().toISOString().slice(0, 10);
-    setSnapshots(prev => [...prev, { id: newId, date: today, values: baseValues, fxRates: baseFx, valueCurrencies: baseCurrencies, valueAmounts: baseAmounts }]);
+    setSnapshots(prev => [...prev, { id: newId, date: today, values: baseValues, fxRates: baseFx, valueCurrencies: baseCurrencies, valueAmounts: baseAmounts, fxRatesTouched: false }]);
     setEditingSnap(newId);
     showToast("New entry added — edit values below");
   }
@@ -2050,8 +2139,13 @@ export default function App() {
               <StatCard label="Cumulative Savings" value={fmtDispCompact(cumulativeSavings)} positive={cumulativeSavings >= 0} sub="income − expenses" />
               <StatCard label="Wealth Created" value={wealthCreated !== null ? fmtDispCompact(wealthCreated) : "—"} positive={wealthCreated === null || wealthCreated >= 0} sub={wealthCreated !== null ? "returns above savings" : "add another net worth entry"} />
               <StatCard label="Savings Rate" value={totalIncome > 0 ? ((netCashFlow / totalIncome) * 100).toFixed(1) + "%" : "—"} positive={netCashFlow >= 0} sub="of total income" />
-              <StatCard label="XIRR" value={xirrResult !== null ? (xirrResult * 100).toFixed(1) + "%" : "—"} positive={xirrResult === null || xirrResult >= 0} sub="annualised, savings-based" />
+              <StatCard label={`XIRR (${displayCurrency})`} value={xirrResult !== null ? (xirrResult * 100).toFixed(1) + "%" : "—"} positive={xirrResult === null || xirrResult >= 0} sub="annualised, currency-adjusted" />
             </div>
+            {displayCurrency !== "INR" && (
+              <p style={{ margin: "-8px 2px 0", fontSize: 12, color: MUTED }}>
+                XIRR reflects your return in {displayCurrency}, including currency effects — it'll differ from the INR-only return if the rupee has moved against {displayCurrency} over the period. Switch the display currency (Settings) to see the same portfolio's return in another currency.
+              </p>
+            )}
 
             {previous && (
               <div className="panel">
@@ -2062,7 +2156,7 @@ export default function App() {
                 <div className="grid-stats" style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 14 }}>
                   <StatCard label="Net Worth Change" value={fmtDispCompact(change)} positive={change >= 0} sub="vs previous entry" />
                   <StatCard label="Wealth Created" value={wealthCreatedSinceLast !== null ? fmtDispCompact(wealthCreatedSinceLast) : "—"} positive={wealthCreatedSinceLast === null || wealthCreatedSinceLast >= 0} sub="returns above savings, since last entry" />
-                  <StatCard label="XIRR" value={xirrSinceLast !== null ? (xirrSinceLast * 100).toFixed(1) + "%" : "—"} positive={xirrSinceLast === null || xirrSinceLast >= 0} sub="annualised, since last entry" />
+                  <StatCard label={`XIRR (${displayCurrency})`} value={xirrSinceLast !== null ? (xirrSinceLast * 100).toFixed(1) + "%" : "—"} positive={xirrSinceLast === null || xirrSinceLast >= 0} sub="annualised, since last entry" />
                 </div>
               </div>
             )}
@@ -2340,24 +2434,31 @@ export default function App() {
 
             {/* Historical rates banner */}
             {(() => {
-              const missing = transactions.filter(t => (t.currency || "INR") !== "INR" && t.fxRateSource !== "historical").length;
+              const missing = transactions.filter(t => (t.currency || "INR") !== "INR" && t.fxRateSource !== "historical" && t.fxRateSource !== "frankfurter").length;
+              const liveCount = transactions.filter(t => t.fxRateSource === "frankfurter").length;
+              const tableCount = transactions.filter(t => t.fxRateSource === "historical").length;
               return missing > 0 ? (
                 <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "10px 16px", background: "#fdf6ec", border: "1px solid #e9d8b8", borderRadius: 10, fontSize: 13, flexWrap: "wrap", gap: 10 }}>
                   <div>
                     <span style={{ color: "#8a6a2a" }}>
-                      ⚠ <strong>{missing}</strong> foreign-currency transactions are using estimated rates.
+                      ⚠ <strong>{missing}</strong> foreign-currency transactions are using rough default rates.
                     </span>
                     <div style={{ fontSize: 11, color: "#a88a50", marginTop: 3 }}>
-                      Rates are looked up via web search (Claude) — only date and currency codes are sent, no transaction data.
+                      Fetching pulls live daily rates from Frankfurter (ECB reference data) for each date; if that's unreachable it falls back to a built-in monthly-average table instead.
                     </div>
                   </div>
                   <button className="btn-ghost" onClick={refreshHistoricalRates} style={{ fontSize: 12, whiteSpace: "nowrap" }}>
                     Fetch historical rates
                   </button>
                 </div>
-              ) : transactions.some(t => t.fxRateSource === "historical") ? (
+              ) : (liveCount > 0 || tableCount > 0) ? (
                 <div style={{ fontSize: 12, color: MUTED, padding: "6px 0" }}>
-                  ✓ All foreign-currency transactions are using confirmed historical rates from Frankfurter (ECB data).
+                  ✓ {liveCount > 0 && `${liveCount} using live daily rates from Frankfurter (ECB)`}
+                  {liveCount > 0 && tableCount > 0 && " · "}
+                  {tableCount > 0 && `${tableCount} using the offline monthly-average table (Frankfurter wasn't reachable)`}.
+                  {tableCount > 0 && (
+                    <button className="btn-icon" onClick={refreshHistoricalRates} style={{ marginLeft: 8 }}>Retry live rates</button>
+                  )}
                 </div>
               ) : null;
             })()}
@@ -2974,9 +3075,11 @@ export default function App() {
                                     {t.currency && t.currency !== "INR" && (
                                       <div style={{ fontSize: 11, color: MUTED, fontWeight: 400 }}>
                                         {CURRENCIES[t.currency]?.symbol}{Math.round(t.origAmount ?? t.amount).toLocaleString("en-IN")} {t.currency}
-                                        {t.fxRateSource === "historical"
-                                          ? <span title="Confirmed historical rate from Frankfurter (ECB)"> · {t.fxRateAtDate?.toFixed(2)} ✓</span>
-                                          : <span style={{ color: "#c97c5d" }} title="Estimated rate — click 'Fetch historical rates' to update"> · {t.fxRateAtDate?.toFixed(2)} est.</span>}
+                                        {t.fxRateSource === "frankfurter"
+                                          ? <span title="Live daily rate from Frankfurter (ECB)"> · {t.fxRateAtDate?.toFixed(2)} ✓</span>
+                                          : t.fxRateSource === "historical"
+                                          ? <span title="Offline monthly-average estimate — click 'Fetch historical rates' to try a live rate"> · {t.fxRateAtDate?.toFixed(2)} ~</span>
+                                          : <span style={{ color: "#c97c5d" }} title="Rough default rate — click 'Fetch historical rates' to update"> · {t.fxRateAtDate?.toFixed(2)} est.</span>}
                                       </div>
                                     )}
                                   </span>}
