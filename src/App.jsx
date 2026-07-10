@@ -3,6 +3,7 @@ import React, { useState, useEffect, useMemo } from "react";
 import { LineChart, Line, AreaChart, Area, PieChart, Pie, Cell, BarChart, Bar, ComposedChart, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from "recharts";
 import * as XLSX from "xlsx";
 import SecuritySettings from "./SecuritySettings";
+import { encryptPayload, decryptPayload, isEncryptedEnvelope } from "./crypto";
 
 // ---------- Seed data ----------
 // This app previously pre-loaded one specific account ("the owner") with
@@ -244,7 +245,7 @@ const STORAGE_KEY = "networth-snapshots";
 const CATKEY = "networth-categories";
 
 export default function App() {
-  const { user, signOut } = useAuth()
+  const { user, signOut, encryptionKey } = useAuth()
 
   const [categories, setCategories] = useState([]);
   const [snapshots, setSnapshots] = useState([]);
@@ -406,10 +407,19 @@ export default function App() {
   }, [snapshots, categories, costBasis, classMap, transactions, displayCurrency, fxRates, categoryRules, incomeCategories, expenseCategories, assetClassOptions, budgets, loaded]);
 
   // ---- Manual backup (export/import JSON) ----
-  function exportBackup() {
+  // Encrypted with the same in-memory session key used for the Supabase
+  // row (see crypto.js) whenever one exists, so a downloaded backup file
+  // sitting in a synced Downloads folder or an email attachment isn't a
+  // plaintext copy of your financial data. Falls back to plaintext only
+  // when there's genuinely no encryption key to use (offline mode with
+  // no Supabase configured, i.e. no account/passphrase system at all).
+  async function exportBackup() {
     const data = { snapshots, categories, costBasis, classMap, transactions, displayCurrency, fxRates, categoryRules, incomeCategories, expenseCategories, assetClassOptions, budgets, exportedAt: new Date().toISOString() };
-    const json = JSON.stringify(data, null, 2);
-    const filename = `networth-backup-${new Date().toISOString().slice(0,10)}.json`;
+    const encrypted = !!encryptionKey;
+    const json = encrypted
+      ? JSON.stringify(await encryptPayload(encryptionKey, data), null, 2)
+      : JSON.stringify(data, null, 2);
+    const filename = `networth-backup-${new Date().toISOString().slice(0,10)}${encrypted ? ".encrypted" : ""}.json`;
     try {
       // Try Blob/createObjectURL first (works in deployed app)
       const blob = new Blob([json], { type: "application/json" });
@@ -430,16 +440,26 @@ export default function App() {
       a.click();
       document.body.removeChild(a);
     }
-    showToast("Backup downloaded");
+    showToast(encrypted ? "Encrypted backup downloaded — your password/passphrase is required to restore it" : "Backup downloaded (unencrypted — no passphrase is set up on this account)");
   }
 
   function importBackup(e) {
     const file = e.target.files?.[0];
     if (!file) return;
     const reader = new FileReader();
-    reader.onload = (ev) => {
+    reader.onload = async (ev) => {
       try {
-        const parsed = JSON.parse(ev.target.result);
+        const raw = JSON.parse(ev.target.result);
+        let parsed = raw;
+        if (isEncryptedEnvelope(raw)) {
+          if (!encryptionKey) { showToast("This backup is encrypted — sign in and unlock your data first"); return; }
+          try {
+            parsed = await decryptPayload(encryptionKey, raw);
+          } catch {
+            showToast("Couldn't decrypt this backup — wrong password/passphrase, or it's from a different account");
+            return;
+          }
+        }
         if (parsed.snapshots) setSnapshots(parsed.snapshots);
         if (parsed.categories) setCategories(parsed.categories);
         if (parsed.costBasis) setCostBasis(parsed.costBasis);
@@ -2168,6 +2188,9 @@ export default function App() {
                 : saveStatus === "error"
                 ? "Auto-save just failed. Download a backup now as a precaution, then try again."
                 : "Your changes auto-save. You can also download a manual backup anytime, or restore from a previous one."}
+              {" "}{encryptionKey
+                ? "Backups are encrypted with your password/passphrase — the file is unreadable without it."
+                : "⚠ No encryption key is active — backups will download as plain, readable JSON."}
             </div>
             <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
               <button className="btn-primary" onClick={exportBackup}>Download backup (.json)</button>
