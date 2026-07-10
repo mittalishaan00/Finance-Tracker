@@ -59,29 +59,30 @@ const CURRENCIES = {
   AED: { symbol: "AED ", label: "AED — UAE Dirham" },
 };
 // Default FX rates expressed as "1 unit of currency = X INR". Editable in-app.
-const DEFAULT_FX_TO_INR = { INR: 1, USD: 95.3, AED: 25.9 };
+const DEFAULT_FX_TO_INR = { INR: 1, USD: 95.37, AED: 25.97 };
 
 // ---------- Historical FX rates ----------
 // Monthly USD/INR averages, used as an OFFLINE FALLBACK when a live rate
 // can't be fetched (see fetchFrankfurterRate below, which is tried first).
 // AED is pegged to USD at exactly 3.6725, so AED/INR = USD/INR / 3.6725.
 //
-// NOTE (corrected — previous table was significantly stale): the rupee
-// depreciated sharply through H2 2025 (US tariff announcement) and again
-// in Q2 2026 (Strait of Hormuz oil shock, record lows near 96.8), neither
-// of which the old hardcoded table reflected — it showed USD/INR flat or
-// even *falling* through those periods when it actually spiked. These
-// figures were rebuilt from public monthly-average data as of this
-// update; if you're seeing this much later, prefer the live fetch path.
+// NOTE (corrected again — the previous "fix" was still wrong in places,
+// e.g. showing 89.0 for July 2025 when the real monthly average was
+// ~86.07). This table is now rebuilt from one consistent source
+// (x-rates.com daily-average data, which was cross-checked against the
+// specific-day report of ~85.6 for July 1 2025) instead of stitching
+// together numbers from several sources with different methodologies —
+// that's likely what caused the earlier mismatches. If you're reading
+// this much later, prefer the live fetch path over this table.
 const HIST_USD_INR = {
-  "2024-01": 83.1, "2024-02": 83.0, "2024-03": 83.3, "2024-04": 83.6,
-  "2024-05": 83.5, "2024-06": 83.5, "2024-07": 83.7, "2024-08": 83.9,
-  "2024-09": 83.8, "2024-10": 84.1, "2024-11": 84.5, "2024-12": 85.0,
-  "2025-01": 85.5, "2025-02": 86.5, "2025-03": 85.8, "2025-04": 85.0,
-  "2025-05": 84.5, "2025-06": 85.5, "2025-07": 89.0, "2025-08": 90.0,
-  "2025-09": 89.3, "2025-10": 89.0, "2025-11": 89.6, "2025-12": 90.3,
-  "2026-01": 89.9, "2026-02": 90.5, "2026-03": 91.5, "2026-04": 89.5,
-  "2026-05": 94.5, "2026-06": 92.8, "2026-07": 95.3,
+  "2024-01": 83.11, "2024-02": 82.97, "2024-03": 83.04, "2024-04": 83.41,
+  "2024-05": 83.35, "2024-06": 83.48, "2024-07": 83.59, "2024-08": 83.88,
+  "2024-09": 83.80, "2024-10": 84.03, "2024-11": 84.38, "2024-12": 84.97,
+  "2025-01": 86.23, "2025-02": 86.96, "2025-03": 86.62, "2025-04": 85.60,
+  "2025-05": 85.20, "2025-06": 85.93, "2025-07": 86.07, "2025-08": 87.52,
+  "2025-09": 88.27, "2025-10": 88.37, "2025-11": 88.88, "2025-12": 90.00,
+  "2026-01": 90.73, "2026-02": 90.77, "2026-03": 92.90, "2026-04": 93.40,
+  "2026-05": 95.44, "2026-06": 95.00, "2026-07": 95.37,
 };
 const AED_PER_USD = 3.6725; // fixed peg, never changes
 
@@ -89,12 +90,14 @@ function historicalRate(date, currency) {
   // Returns INR per 1 unit of currency for the given date, from the
   // offline reference table. Prefer fetchFrankfurterRate() for a real
   // live lookup; this is the synchronous fallback used when that isn't
-  // available (offline, or before a refresh has completed).
+  // available (offline, or before a refresh has completed). Rounded to
+  // 4dp so it doesn't carry long floating-point tails (e.g. AED/INR as
+  // 24.23417290673928) into stored data and displays.
   if (!date || currency === "INR") return 1;
   const month = String(date).slice(0, 7); // "YYYY-MM"
   const usdInr = HIST_USD_INR[month] || DEFAULT_FX_TO_INR.USD;
-  if (currency === "USD") return usdInr;
-  if (currency === "AED") return usdInr / AED_PER_USD;
+  if (currency === "USD") return Math.round(usdInr * 10000) / 10000;
+  if (currency === "AED") return Math.round((usdInr / AED_PER_USD) * 10000) / 10000;
   return DEFAULT_FX_TO_INR[currency] || 1; // fallback for unknown currencies
 }
 
@@ -123,7 +126,7 @@ async function fetchFrankfurterRate(date, currency) {
     const data = await res.json();
     const usdInr = data?.rates?.INR;
     if (!usdInr || !isFinite(usdInr)) throw new Error("no INR rate in response");
-    const rate = currency === "AED" ? usdInr / AED_PER_USD : usdInr;
+    const rate = Math.round((currency === "AED" ? usdInr / AED_PER_USD : usdInr) * 10000) / 10000;
     liveRateCache.set(cacheKey, rate);
     return rate;
   } catch (e) {
@@ -1058,6 +1061,37 @@ export default function App() {
       fallbackCount > 0
         ? `Updated ${liveCount + fallbackCount} — ${liveCount} live, ${fallbackCount} from offline table (couldn't reach Frankfurter)`
         : `Updated ${liveCount} transactions with live historical rates`
+    );
+  }
+
+  // Net worth entries get their fx rates auto-populated at creation time
+  // (see updateSnapshotDate/addSnapshot), but that only happens going
+  // forward — entries created before a reference-table correction keep
+  // whatever rate was baked in when they were saved. This refreshes any
+  // entry the user hasn't manually edited (fxRatesTouched) against the
+  // current table/live rates, without touching ones they've hand-set.
+  async function refreshSnapshotRates() {
+    const targets = sortedSnapshots.filter(s => !s.fxRatesTouched);
+    if (targets.length === 0) { showToast("All entries have manually-set rates"); return; }
+    showToast(`Refreshing rates for ${targets.length} ${targets.length === 1 ? "entry" : "entries"}…`);
+
+    let liveCount = 0, fallbackCount = 0;
+    const updates = {};
+    await Promise.all(targets.map(async s => {
+      const liveUsd = await fetchFrankfurterRate(s.date, "USD");
+      if (liveUsd !== null) {
+        liveCount++;
+        updates[s.id] = { INR: 1, USD: liveUsd, AED: Math.round((liveUsd / AED_PER_USD) * 10000) / 10000 };
+      } else {
+        fallbackCount++;
+        updates[s.id] = { INR: 1, USD: historicalRate(s.date, "USD"), AED: historicalRate(s.date, "AED") };
+      }
+    }));
+    setSnapshots(prev => prev.map(s => updates[s.id] ? { ...s, fxRates: updates[s.id] } : s));
+    showToast(
+      fallbackCount > 0
+        ? `Updated ${liveCount + fallbackCount} — ${liveCount} live, ${fallbackCount} from offline table`
+        : `Updated ${liveCount} ${liveCount === 1 ? "entry" : "entries"} with live rates`
     );
   }
 
@@ -2361,12 +2395,12 @@ export default function App() {
                               ))}
                               <td>
                                 <input className="num-input" type="number" step="0.01" style={{ width: 72 }}
-                                  value={r.fxRates?.USD ?? DEFAULT_FX_TO_INR.USD}
+                                  value={Number(r.fxRates?.USD ?? DEFAULT_FX_TO_INR.USD).toFixed(2)}
                                   onChange={e => setNwImportPreview(prev => prev.map((x, i) => i === ri ? { ...x, fxRates: { ...x.fxRates, USD: Number(e.target.value) } } : x))} />
                               </td>
                               <td>
                                 <input className="num-input" type="number" step="0.01" style={{ width: 72 }}
-                                  value={r.fxRates?.AED ?? DEFAULT_FX_TO_INR.AED}
+                                  value={Number(r.fxRates?.AED ?? DEFAULT_FX_TO_INR.AED).toFixed(2)}
                                   onChange={e => setNwImportPreview(prev => prev.map((x, i) => i === ri ? { ...x, fxRates: { ...x.fxRates, AED: Number(e.target.value) } } : x))} />
                               </td>
                               <td style={{ fontFamily: "'JetBrains Mono', monospace", fontWeight: 700 }}>{fmtDispCompact(total)}</td>
@@ -2395,7 +2429,10 @@ export default function App() {
             <div className="panel scroll-x">
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
                 <PanelTitle noMargin>All entries ({sortedSnapshots.length})</PanelTitle>
-                <button className="btn-ghost" onClick={addSnapshot}>+ Add entry manually</button>
+                <div style={{ display: "flex", gap: 8 }}>
+                  <button className="btn-ghost" onClick={refreshSnapshotRates} title="Re-fetch USD/AED rates for entries you haven't manually edited">Refresh exchange rates</button>
+                  <button className="btn-ghost" onClick={addSnapshot}>+ Add entry manually</button>
+                </div>
               </div>
               <table>
                 <thead>
@@ -2449,13 +2486,13 @@ export default function App() {
                         <td style={{ fontWeight: 700, fontFamily: "'JetBrains Mono', monospace" }}>{fmtCCAt(total, s.fxRates)}</td>
                         <td>
                           {isEditing ? (
-                            <input className="num-input" type="number" step="0.01" style={{ width: 80 }} value={s.fxRates?.USD ?? DEFAULT_FX_TO_INR.USD} onChange={e => updateSnapshotFx(s.id, "USD", e.target.value)} />
-                          ) : (s.fxRates?.USD ?? DEFAULT_FX_TO_INR.USD)}
+                            <input className="num-input" type="number" step="0.01" style={{ width: 80 }} value={Number(s.fxRates?.USD ?? DEFAULT_FX_TO_INR.USD).toFixed(2)} onChange={e => updateSnapshotFx(s.id, "USD", e.target.value)} />
+                          ) : (Number(s.fxRates?.USD ?? DEFAULT_FX_TO_INR.USD)).toFixed(2)}
                         </td>
                         <td>
                           {isEditing ? (
-                            <input className="num-input" type="number" step="0.01" style={{ width: 80 }} value={s.fxRates?.AED ?? DEFAULT_FX_TO_INR.AED} onChange={e => updateSnapshotFx(s.id, "AED", e.target.value)} />
-                          ) : (s.fxRates?.AED ?? DEFAULT_FX_TO_INR.AED)}
+                            <input className="num-input" type="number" step="0.01" style={{ width: 80 }} value={Number(s.fxRates?.AED ?? DEFAULT_FX_TO_INR.AED).toFixed(2)} onChange={e => updateSnapshotFx(s.id, "AED", e.target.value)} />
+                          ) : (Number(s.fxRates?.AED ?? DEFAULT_FX_TO_INR.AED)).toFixed(2)}
                         </td>
                         <td style={{ whiteSpace: "nowrap" }}>
                           {isEditing ? (
@@ -3332,11 +3369,11 @@ export default function App() {
                   <div style={{ display: "flex", gap: 10 }}>
                     <div>
                       <label style={{ fontSize: 12, color: MUTED, display: "block", marginBottom: 4 }}>1 USD = ? INR</label>
-                      <input className="num-input" type="number" step="0.01" style={{ width: 120 }} value={latest.fxRates?.USD ?? DEFAULT_FX_TO_INR.USD} onChange={e => updateSnapshotFx(latest.id, "USD", e.target.value)} />
+                      <input className="num-input" type="number" step="0.01" style={{ width: 120 }} value={Number(latest.fxRates?.USD ?? DEFAULT_FX_TO_INR.USD).toFixed(2)} onChange={e => updateSnapshotFx(latest.id, "USD", e.target.value)} />
                     </div>
                     <div>
                       <label style={{ fontSize: 12, color: MUTED, display: "block", marginBottom: 4 }}>1 AED = ? INR</label>
-                      <input className="num-input" type="number" step="0.01" style={{ width: 120 }} value={latest.fxRates?.AED ?? DEFAULT_FX_TO_INR.AED} onChange={e => updateSnapshotFx(latest.id, "AED", e.target.value)} />
+                      <input className="num-input" type="number" step="0.01" style={{ width: 120 }} value={Number(latest.fxRates?.AED ?? DEFAULT_FX_TO_INR.AED).toFixed(2)} onChange={e => updateSnapshotFx(latest.id, "AED", e.target.value)} />
                     </div>
                   </div>
                 </div>
