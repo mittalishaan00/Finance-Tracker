@@ -1212,49 +1212,113 @@ export default function App() {
   }
 
   // ---- CSV import ----
-  function parseCSV(text) {
-    const lines = text.trim().split(/\r?\n/);
-    if (lines.length < 2) return null;
-    const splitLine = (line) => {
-      // basic CSV split handling quoted commas
-      const out = [];
-      let cur = "", inQ = false;
-      for (let i = 0; i < line.length; i++) {
-        const ch = line[i];
-        if (ch === '"') inQ = !inQ;
-        else if (ch === "," && !inQ) { out.push(cur.trim()); cur = ""; }
-        else cur += ch;
+  // Tokenizes the *entire file* (not line-by-line) so that quoted fields
+  // containing literal newlines — common in exports where a "Description"
+  // cell wraps onto multiple physical lines inside its quotes — don't get
+  // split into bogus extra rows. Returns an array of rows, each an array
+  // of trimmed field strings.
+  function tokenizeCSV(text) {
+    const rows = [];
+    let row = [], cur = "", inQ = false;
+    for (let i = 0; i < text.length; i++) {
+      const ch = text[i];
+      if (inQ) {
+        if (ch === '"') {
+          if (text[i + 1] === '"') { cur += '"'; i++; } // escaped quote
+          else inQ = false;
+        } else {
+          cur += ch;
+        }
+      } else if (ch === '"') {
+        inQ = true;
+      } else if (ch === ",") {
+        row.push(cur.trim()); cur = "";
+      } else if (ch === "\n" || ch === "\r") {
+        if (ch === "\r" && text[i + 1] === "\n") i++;
+        row.push(cur.trim()); cur = "";
+        // Skip rows that are entirely empty (blank line, or a stray blank
+        // continuation from a multi-line quoted cell that split oddly).
+        if (row.some(f => f !== "")) rows.push(row);
+        row = [];
+      } else {
+        cur += ch;
       }
-      out.push(cur.trim());
-      return out;
-    };
-    const headers = splitLine(lines[0]).map(h => h.toLowerCase());
-    const rows = lines.slice(1).filter(l => l.trim()).map(l => splitLine(l));
+    }
+    if (cur !== "" || row.length) { row.push(cur.trim()); if (row.some(f => f !== "")) rows.push(row); }
+    return rows;
+  }
+
+  // Some exports put "Account No: ... / Currency: ..." style metadata in
+  // quoted preamble rows before the real header row. Find the header row
+  // by looking for the first row containing a recognizable "date" column
+  // name, and pull any account-level currency mentioned before it.
+  function findCsvHeaderRow(rows) {
+    for (let i = 0; i < rows.length; i++) {
+      const lower = rows[i].map(f => (f || "").toLowerCase());
+      if (lower.some(f => f === "date" || f.includes("date")) &&
+          lower.some(f => f.includes("amount") || f.includes("debit") || f.includes("credit"))) {
+        return i;
+      }
+    }
+    return -1;
+  }
+
+  // Strips thousands separators, including Indian-style grouping
+  // ("5,00,000.00" = 500000) — comma-stripping alone handles both since
+  // grouping style doesn't affect which characters are digits.
+  function parseAmountStr(s) {
+    return parseFloat((s || "0").replace(/[^0-9.\-]/g, "")) || 0;
+  }
+
+  function parseCSV(text) {
+    const allRows = tokenizeCSV(text.replace(/^\uFEFF/, "")); // strip BOM
+    if (allRows.length < 2) return null;
+
+    const headerIdx = findCsvHeaderRow(allRows);
+    if (headerIdx === -1) return null;
+
+    // Pull a fallback currency out of any preamble rows (e.g. "Currency:AED")
+    const preambleText = allRows.slice(0, headerIdx).flat().join(" ");
+    const preambleCcyMatch = preambleText.match(/currency[:\s]*([A-Z]{3})/i);
+    const preambleCurrency = preambleCcyMatch && CURRENCIES[preambleCcyMatch[1].toUpperCase()]
+      ? preambleCcyMatch[1].toUpperCase() : null;
+
+    const headers = allRows[headerIdx].map(h => h.toLowerCase());
+    const rows = allRows.slice(headerIdx + 1).filter(r => r.some(f => f !== ""));
 
     const dateIdx = headers.findIndex(h => h.includes("date"));
-    const descIdx = headers.findIndex(h => h.includes("desc") || h.includes("narration") || h.includes("particular") || h.includes("merchant"));
-    const debitIdx = headers.findIndex(h => h.includes("debit") || h.includes("withdrawal"));
-    const creditIdx = headers.findIndex(h => h.includes("credit") || h.includes("deposit"));
+    const descIdx = headers.findIndex(h => h.includes("desc") || h.includes("narration") || h.includes("particular") || h.includes("merchant") || h.includes("detail"));
+    const debitIdx = headers.findIndex(h => h.includes("debit") && !h.includes("credit") || h.includes("withdrawal"));
+    const creditIdx = headers.findIndex(h => h.includes("credit") && !h.includes("debit") || h.includes("deposit"));
+    // Some statements have ONE "Amount" column plus a separate text column
+    // that says literally "Debit" or "Credit" per row (rather than two
+    // amount columns) — detect that pattern explicitly.
+    const debitCreditTextIdx = headers.findIndex(h => h.includes("debit") && h.includes("credit"));
     const amountIdx = headers.findIndex(h => h === "amount" || h.includes("amount"));
     const currencyIdx = headers.findIndex(h => h.includes("currency") || h === "ccy");
 
     const parsed = rows.map((r, i) => {
       let amount = 0, type = "expense";
-      if (debitIdx >= 0 || creditIdx >= 0) {
-        const debit = parseFloat((r[debitIdx] || "0").replace(/[^0-9.\-]/g, "")) || 0;
-        const credit = parseFloat((r[creditIdx] || "0").replace(/[^0-9.\-]/g, "")) || 0;
+      if (debitCreditTextIdx >= 0 && amountIdx >= 0) {
+        amount = Math.abs(parseAmountStr(r[amountIdx]));
+        type = /credit/i.test(r[debitCreditTextIdx] || "") ? "income" : "expense";
+      } else if (debitIdx >= 0 || creditIdx >= 0) {
+        const debit = parseAmountStr(r[debitIdx]);
+        const credit = parseAmountStr(r[creditIdx]);
         if (credit > 0) { amount = credit; type = "income"; }
         else { amount = debit; type = "expense"; }
       } else if (amountIdx >= 0) {
-        const raw = parseFloat((r[amountIdx] || "0").replace(/[^0-9.\-]/g, "")) || 0;
+        const raw = parseAmountStr(r[amountIdx]);
         amount = Math.abs(raw);
         type = raw >= 0 ? "income" : "expense";
       }
       const dateRaw = dateIdx >= 0 ? r[dateIdx] : "";
       const d = parseFlexDate(dateRaw);
       const date = isNaN(d.getTime()) ? new Date().toISOString().slice(0,10) : d.toISOString().slice(0,10);
-      const description = descIdx >= 0 ? r[descIdx] : r.join(" ");
-      const currencyRaw = currencyIdx >= 0 ? (r[currencyIdx] || "").toUpperCase() : "INR";
+      const description = (descIdx >= 0 ? r[descIdx] : r.join(" ")).replace(/\s+/g, " ").trim();
+      // Per-row currency column wins; otherwise fall back to whatever
+      // currency was declared in the file's preamble metadata; otherwise INR.
+      const currencyRaw = currencyIdx >= 0 && r[currencyIdx] ? r[currencyIdx].toUpperCase() : (preambleCurrency || "INR");
       const currency = CURRENCIES[currencyRaw] ? currencyRaw : "INR";
       return {
         id: "imp-" + Date.now() + "-" + i,
@@ -1508,9 +1572,78 @@ export default function App() {
     }
   }
 
+  const MONTH_ABBRS = ["jan","feb","mar","apr","may","jun","jul","aug","sep","oct","nov","dec"];
+
+  // Infer the year for statements whose per-row dates omit it (e.g. credit
+  // card statements printing "24 Mar" instead of "24 Mar 2026") by reading
+  // the statement period from the header ("16 Mar 2026 - 15 Apr 2026") or a
+  // "Statement Date" line, and mapping each month to the right year — this
+  // matters because the period, and therefore the transactions in it,
+  // typically spans a month boundary (and occasionally a year boundary).
+  function buildMonthYearMap(allText) {
+    const map = {};
+    const period = allText.match(/(\d{1,2})\s+([A-Za-z]{3,})\s+(\d{4})\s*-\s*(\d{1,2})\s+([A-Za-z]{3,})\s+(\d{4})/);
+    if (period) {
+      const [, , startMon, startYear, , endMon, endYear] = period;
+      const sIdx = MONTH_ABBRS.indexOf(startMon.slice(0, 3).toLowerCase());
+      const eIdx = MONTH_ABBRS.indexOf(endMon.slice(0, 3).toLowerCase());
+      if (sIdx !== -1 && eIdx !== -1) {
+        let idx = sIdx, year = parseInt(startYear, 10);
+        const endYearNum = parseInt(endYear, 10);
+        for (let guard = 0; guard < 14; guard++) {
+          map[MONTH_ABBRS[idx]] = year;
+          if (idx === eIdx && year === endYearNum) break;
+          idx = (idx + 1) % 12;
+          if (idx === 0) year++;
+        }
+        return map;
+      }
+    }
+    // Fallback: a single "Statement Date: 16 Apr 2026" — walk back 12
+    // months from it, assigning the statement year to months up to and
+    // including that month, and the prior year to months after it.
+    const single = allText.match(/statement\s+date[:\s]+(\d{1,2})\s+([A-Za-z]{3,})\s+(\d{4})/i);
+    if (single) {
+      const [, , mon, year] = single;
+      const mIdx = MONTH_ABBRS.indexOf(mon.slice(0, 3).toLowerCase());
+      const y = parseInt(year, 10);
+      if (mIdx !== -1) {
+        for (let i = 0; i < 12; i++) {
+          const idx = ((mIdx - i) % 12 + 12) % 12;
+          map[MONTH_ABBRS[idx]] = i <= mIdx ? y : y - 1;
+        }
+        return map;
+      }
+    }
+    return null;
+  }
+
+  // Category tags some issuers print directly on each row (in a colored
+  // pill/badge) — when present these are more reliable than guessing from
+  // the merchant name, so they take priority over categorise().
+  const PDF_CATEGORY_TAG_MAP = {
+    "food & dining": "Dining",
+    "taxi/rick/metro": "Transport",
+    "travel": "Travel",
+    "health & wellness": "Healthcare",
+    "shopping": "Shopping",
+    "groceries": "Groceries",
+    "entertainment": "Entertainment",
+    "utilities": "Utilities",
+  };
+  // Rows tagged with these represent paying off the card, or the bank's own
+  // fee/interest bookkeeping — not a spend to import.
+  const PDF_SKIP_TAG_RE = /^(repayments?|new emi|paid via)/i;
+  // Noise tokens from stacked "Forex Fee = X" / "GST @ 18% = Y" sub-lines
+  // that got merged in during page-break stitching — not part of the
+  // description and shouldn't be treated as amount candidates either.
+  const PDF_NOISE_RE = /^(forex|fee|gst|@|=|\d{1,2}%)$/i;
+
   function parsePdfItems(items) {
     // ── Step 0: Detect statement currency from header text ──
     const allText = items.map(it => it.text).join(" ");
+    const monthYearMap = buildMonthYearMap(allText);
+    const hasRewardPointsCol = /reward\s*points/i.test(allText);
 
     // Explicit currency codes/symbols in the text
     const detectedCurrency = (() => {
@@ -1559,22 +1692,65 @@ export default function App() {
     // Sort items within each line by x
     lines.forEach(l => l.items.sort((a, b) => a.x - b.x));
 
+    // ── Step 1.5: Strip "null / huge-number" extraction artifacts ──
+    // Some statement PDFs carry a hidden/overlapping text layer that
+    // surfaces as a literal "null" token followed by an implausibly large
+    // number (e.g. "1,226.71 null 34,112,000.00") right after the real
+    // amount. Anything from a stray "null" token onward on a line is
+    // discarded — it isn't part of the visible statement.
+    lines.forEach(l => {
+      const nullIdx = l.items.findIndex(it => /^null$/i.test(it.text));
+      if (nullIdx !== -1) l.items = l.items.slice(0, nullIdx);
+    });
+    for (let i = lines.length - 1; i >= 0; i--) {
+      if (lines[i].items.length === 0) lines.splice(i, 1);
+    }
+
     // ── Step 2: Detect column structure ──
-    // Collect all x positions of first-tokens and amount-like tokens
-    const DATE_RE = /^\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4}$|^\d{4}[\/\-\.]\d{1,2}[\/\-\.]\d{1,2}$|^\d{1,2}\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{4}$/i;
+    // Dates with an explicit year, OR bare "dd Mon" (common on credit-card
+    // statements whose transaction table omits the year and relies on the
+    // statement period shown elsewhere on the page).
+    const DATE_RE = /^\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4}$|^\d{4}[\/\-\.]\d{1,2}[\/\-\.]\d{1,2}$|^\d{1,2}\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{4}$|^\d{1,2}\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)$/i;
     const AMOUNT_RE = /^[\d,]+\.?\d*$/;
     const CRDR_RE = /^(CR|DR|Credit|Debit|C|D)$/i;
     const SKIP_RE = /^(page|statement|account|balance|total|opening|closing|carried|brought|date|description|narration|particulars|debit|credit|amount|currency|ref|reference|type|transaction)$/i;
 
+    // ── Step 1.6: Stitch rows split across a page break or across stacked
+    // visual sub-lines (fee/GST breakdown under the merchant name). A
+    // "date-started" line with no amount-like token yet is incomplete; pull
+    // in the following line(s) — which won't start with a date — until one
+    // is found that carries an amount, or give up after a few lines so we
+    // never run off into unrelated boilerplate.
+    const consumed = new Set();
+    const mergedLines = [];
+    lines.forEach((line, idx) => {
+      if (consumed.has(idx)) return;
+      const first = line.items[0]?.text;
+      if (!(first && DATE_RE.test(first))) { mergedLines.push(line); return; }
+
+      let combinedItems = [...line.items];
+      let hasAmount = combinedItems.slice(1).some(it => AMOUNT_RE.test(it.text.replace(/,/g, "")));
+      let lookahead = idx + 1, steps = 0;
+      while (!hasAmount && lookahead < lines.length && steps < 4) {
+        const nextFirst = lines[lookahead].items[0]?.text;
+        if (nextFirst && DATE_RE.test(nextFirst)) break; // hit the next real row — stop
+        combinedItems = combinedItems.concat(lines[lookahead].items);
+        consumed.add(lookahead);
+        hasAmount = lines[lookahead].items.some(it => AMOUNT_RE.test(it.text.replace(/,/g, "")));
+        lookahead++; steps++;
+      }
+      mergedLines.push({ ...line, items: combinedItems });
+    });
+
     // Find lines that look like transaction rows (start with a date)
-    const txLines = lines.filter(l => {
+    const txLines = mergedLines.filter(l => {
       const first = l.items[0]?.text;
       return first && DATE_RE.test(first);
     });
 
     if (txLines.length < 2) {
       // Try relaxed: lines where any token is a date
-      const relaxed = lines.filter(l => l.items.some(it => DATE_RE.test(it.text)));
+      const relaxed = mergedLines.filter(l => l.items.some(it => DATE_RE.test(it.text)));
       if (relaxed.length < 2) return null;
       txLines.push(...relaxed);
     }
@@ -1605,18 +1781,31 @@ export default function App() {
       const dateItem = its.find(it => DATE_RE.test(it.text));
       if (!dateItem) return;
 
-      // Description: all items between date and amount zone
+      // A known category tag (printed as a colored pill on some statements)
+      // beats guessing from the merchant name when present.
+      const lineText = its.map(it => it.text).join(" ");
+      const tagMatch = Object.keys(PDF_CATEGORY_TAG_MAP).find(tag =>
+        new RegExp(tag.replace(/[&/]/g, m => "\\" + m), "i").test(lineText)
+      );
+      // Rows that are really "you paid your bill" / EMI bookkeeping, not a spend.
+      if (PDF_SKIP_TAG_RE.test(lineText.trim()) || /paid via/i.test(lineText)) return;
+
+      // Description: all items between date and amount zone, minus stacked
+      // "Forex Fee = X" / "GST @ 18% = Y" sub-line noise pulled in by the
+      // page-break stitching pass, and minus the category tag itself.
       const descItems = its.filter(it =>
         it.x > dateItem.x + dateItem.w &&
         it.x < rightZone &&
         !DATE_RE.test(it.text) &&
         !CRDR_RE.test(it.text) &&
-        !AMOUNT_RE.test(it.text)
+        !AMOUNT_RE.test(it.text) &&
+        !PDF_NOISE_RE.test(it.text) &&
+        !(tagMatch && it.text.toLowerCase() === tagMatch)
       );
-      const description = descItems.map(it => it.text).join(" ").trim();
+      const description = descItems.map(it => it.text).join(" ").replace(/\s+/g, " ").trim();
 
       // Amount items: rightmost numeric tokens
-      const amountItems = its.filter(it => it.x >= rightZone && AMOUNT_RE.test(it.text.replace(/,/g, "")));
+      let amountItems = its.filter(it => it.x >= rightZone && AMOUNT_RE.test(it.text.replace(/,/g, "")));
       if (amountItems.length === 0) return;
 
       // CR/DR indicator
@@ -1627,6 +1816,12 @@ export default function App() {
       if (hasCrDr && crdrItem) {
         amount = parseFloat(amountItems[amountItems.length - 1].text.replace(/,/g, "")) || 0;
         type = /^(CR|Credit|C)$/i.test(crdrItem.text) ? "income" : "expense";
+      } else if (hasRewardPointsCol && amountItems.length >= 2) {
+        // Statements with a reward-points column print points just before
+        // the amount, not a separate debit/credit pair — the real amount
+        // is always the last (rightmost) numeric token.
+        amount = parseFloat(amountItems[amountItems.length - 1].text.replace(/,/g, "")) || 0;
+        type = "expense";
       } else if (amountItems.length >= 2) {
         // Two amount columns: debit and credit (one may be empty — represented by 0 or absent)
         // Heuristic: if last two numeric values, first=debit, second=credit
@@ -1652,7 +1847,7 @@ export default function App() {
 
       if (amount <= 0 || !description) return;
 
-      const dateStr = toIsoDate(dateItem.text);
+      const dateStr = toIsoDate(dateItem.text, monthYearMap);
       if (!dateStr) return;
 
       // Per-row currency: some banks print "AED", "INR", or "USD" next to each amount
@@ -1661,6 +1856,8 @@ export default function App() {
         ? rowCurrencyItem.text.toUpperCase()
         : detectedCurrency;
 
+      const category = tagMatch ? PDF_CATEGORY_TAG_MAP[tagMatch] : categorise(description, type);
+
       rows.push({
         id: "pdf-" + li + "-" + Math.random().toString(36).slice(2, 6),
         date: dateStr,
@@ -1668,7 +1865,7 @@ export default function App() {
         amount,
         currency: rowCurrency,
         description,
-        category: categorise(description, type),
+        category,
         _selected: true,
       });
     });
@@ -1676,7 +1873,7 @@ export default function App() {
     return rows.length > 0 ? { rows, detectedCurrency } : null;
   }
 
-  function toIsoDate(str) {
+  function toIsoDate(str, monthYearMap) {
     // Handle dd/mm/yyyy, dd-mm-yyyy, dd.mm.yyyy, yyyy-mm-dd, "13 Jun 2026" etc.
     if (!str) return null;
     const s = str.trim();
@@ -1696,6 +1893,16 @@ export default function App() {
       const [, d, mon, y] = dmy2;
       const m = months[mon.slice(0,3).toLowerCase()];
       if (m) return `${y}-${String(m).padStart(2,"0")}-${d.padStart(2,"0")}`;
+    }
+    // "24 Mar" — no year printed; use the year inferred from the statement
+    // period/statement-date header, if one was found.
+    const dmyBare = s.match(/^(\d{1,2})\s+([A-Za-z]{3,})$/);
+    if (dmyBare && monthYearMap) {
+      const [, d, mon] = dmyBare;
+      const key = mon.slice(0, 3).toLowerCase();
+      const m = months[key];
+      const year = monthYearMap[key];
+      if (m && year) return `${year}-${String(m).padStart(2,"0")}-${d.padStart(2,"0")}`;
     }
     return null;
   }
