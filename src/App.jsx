@@ -174,6 +174,18 @@ function parseFlexDate(s) {
   return new Date();
 }
 
+// new Date("04 Jul 2026") is constructed at LOCAL midnight. Calling
+// .toISOString() on it converts to UTC, which for any timezone ahead of
+// UTC (Dubai is UTC+4, India is UTC+5:30) rolls it back to the previous
+// day ("04 Jul" -> "2026-07-03"). Use local getters instead so the
+// calendar date typed/printed on the statement is the date we store.
+function toLocalISODate(d) {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
 
 // cashflows: array of {date: Date, amount: number} (negative = outflow/investment, positive = inflow/return)
 //
@@ -1314,7 +1326,7 @@ export default function App() {
       }
       const dateRaw = dateIdx >= 0 ? r[dateIdx] : "";
       const d = parseFlexDate(dateRaw);
-      const date = isNaN(d.getTime()) ? new Date().toISOString().slice(0,10) : d.toISOString().slice(0,10);
+      const date = isNaN(d.getTime()) ? toLocalISODate(new Date()) : toLocalISODate(d);
       const description = (descIdx >= 0 ? r[descIdx] : r.join(" ")).replace(/\s+/g, " ").trim();
       // Per-row currency column wins; otherwise fall back to whatever
       // currency was declared in the file's preamble metadata; otherwise INR.
@@ -1637,7 +1649,9 @@ export default function App() {
   // Noise tokens from stacked "Forex Fee = X" / "GST @ 18% = Y" sub-lines
   // that got merged in during page-break stitching — not part of the
   // description and shouldn't be treated as amount candidates either.
-  const PDF_NOISE_RE = /^(forex|fee|gst|@|=|\d{1,2}%)$/i;
+  // Matches whether pdf.js emitted these as one combined text item
+  // ("Forex Fee = 12.12") or several separate word-level items.
+  const PDF_NOISE_RE = /\bforex\b|\bgst\b|\bfee\b|^[@=]$|^\d{1,2}%$/i;
 
   function parsePdfItems(items) {
     // ── Step 0: Detect statement currency from header text ──
@@ -1723,6 +1737,7 @@ export default function App() {
     // never run off into unrelated boilerplate.
     const consumed = new Set();
     const mergedLines = [];
+    const isFeeNoiseLine = (l) => /forex\s*fee|gst\s*@/i.test(l.items.map(it => it.text).join(" "));
     lines.forEach((line, idx) => {
       if (consumed.has(idx)) return;
       const first = line.items[0]?.text;
@@ -1731,12 +1746,18 @@ export default function App() {
       let combinedItems = [...line.items];
       let hasAmount = combinedItems.slice(1).some(it => AMOUNT_RE.test(it.text.replace(/,/g, "")));
       let lookahead = idx + 1, steps = 0;
-      while (!hasAmount && lookahead < lines.length && steps < 4) {
-        const nextFirst = lines[lookahead].items[0]?.text;
+      while (!hasAmount && lookahead < lines.length && steps < 6) {
+        const nextLine = lines[lookahead];
+        const nextFirst = nextLine.items[0]?.text;
         if (nextFirst && DATE_RE.test(nextFirst)) break; // hit the next real row — stop
-        combinedItems = combinedItems.concat(lines[lookahead].items);
+        combinedItems = combinedItems.concat(nextLine.items);
         consumed.add(lookahead);
-        hasAmount = lines[lookahead].items.some(it => AMOUNT_RE.test(it.text.replace(/,/g, "")));
+        // "Forex Fee = 12.12" / "GST @ 18% = 2.18" sub-lines contain numbers
+        // too, but they're not the transaction amount — skip past them
+        // without treating their numbers as the row's amount.
+        if (!isFeeNoiseLine(nextLine)) {
+          hasAmount = nextLine.items.some(it => AMOUNT_RE.test(it.text.replace(/,/g, "")));
+        }
         lookahead++; steps++;
       }
       mergedLines.push({ ...line, items: combinedItems });
