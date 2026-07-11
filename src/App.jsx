@@ -1652,6 +1652,11 @@ export default function App() {
   // Matches whether pdf.js emitted these as one combined text item
   // ("Forex Fee = 12.12") or several separate word-level items.
   const PDF_NOISE_RE = /\bforex\b|\bgst\b|\bfee\b|^[@=]$|^\d{1,2}%$/i;
+  // "Transaction Type" column values some issuers print per row (POS,
+  // ECOM, TOKEN_ECOM, ATM, UPI, ...) — a separate column from the merchant
+  // name, so it must not leak into the description the same way the
+  // category pill doesn't.
+  const PDF_TXN_TYPE_RE = /^(POS|ECOM|TOKEN_ECOM|ATM|UPI|IMPS|NEFT|RTGS|CNP|CARD_NOT_PRESENT|ONLINE)$/i;
 
   function parsePdfItems(items) {
     // ── Step 0: Detect statement currency from header text ──
@@ -1821,6 +1826,7 @@ export default function App() {
         !CRDR_RE.test(it.text) &&
         !AMOUNT_RE.test(it.text) &&
         !PDF_NOISE_RE.test(it.text) &&
+        !PDF_TXN_TYPE_RE.test(it.text) &&
         !(tagMatch && it.text.toLowerCase() === tagMatch)
       );
       const description = descItems.map(it => it.text).join(" ").replace(/\s+/g, " ").trim();
