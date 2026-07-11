@@ -1658,6 +1658,147 @@ export default function App() {
   // category pill doesn't.
   const PDF_TXN_TYPE_RE = /^(POS|ECOM|TOKEN_ECOM|ATM|UPI|IMPS|NEFT|RTGS|CNP|CARD_NOT_PRESENT|ONLINE)$/i;
 
+  const PDF_SECTION_END_RE = /^important information$/i;
+
+  // Reconstructs transaction rows for statements that stack a merchant name,
+  // its fee/GST sub-notes, and an amount+artifact trio as separate visual
+  // sub-lines around each date, rather than one row per y-position.
+  //
+  // Strategy: find every date-shaped item ("row anchor"), then assign every
+  // *other* item to whichever anchor it visually belongs to — not by naive
+  // y-distance (which breaks once a row spans a page break), but by reading
+  // order: an item belongs to the next anchor if it sits just above that
+  // anchor's date on the same page (the common "merchant name printed a
+  // few px above its own date" pattern), or if it's trailing content at the
+  // bottom of a page with no further anchor before the page ends (the head
+  // of a row whose rest got pushed to the next page); otherwise it belongs
+  // to the most recently seen anchor (fee/GST sub-notes, or an orphaned
+  // continuation at the very top of the next page).
+  //
+  // Within each anchor's block, items are bucketed into columns by their x
+  // position (columns are detected from natural gaps in x, not hardcoded
+  // pixel values, so this isn't tied to one specific issuer's layout): the
+  // leftmost column holds the merchant name (skipping "Forex Fee"/"GST @"
+  // sub-notes), and the rightmost column holds the amount — taking the
+  // topmost numeric value there, since the "null" + huge-number extraction
+  // artifact always renders below the real amount within that same column.
+  //
+  // A block with no amount at all is the head of a row that got split
+  // across a page break; its merchant name is carried forward and used by
+  // the very next block whose own leftmost-column text turned out to be a
+  // stray category tag (i.e. its real merchant name was the thing that got
+  // split off into that previous, amount-less block).
+  function parseStackedPdfRows(items, monthYearMap, detectedCurrency) {
+    // Transaction rows in this layout always print a bare "dd Mon" with no
+    // year (the year is inferred separately from the statement period).
+    // Deliberately narrower than the general DATE_RE — header/summary lines
+    // like "Statement Date 16 Apr 2026" or the "16 Mar 2026 - 15 Apr 2026"
+    // period both include a year and so won't be mistaken for a row anchor.
+    const DATE_RE = /^\d{1,2}\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)$/i;
+    const AMOUNT_RE = /^[\d,]+\.?\d*$/;
+    const PAGE_OFFSET = 100000;
+    const posOf = (it) => it.page * PAGE_OFFSET + it.y;
+
+    // Scope to the transaction table itself: start after its heading (if
+    // found) and hard-stop at a trailing section heading (T&Cs, interest-
+    // calc examples, footer) so neither leaks into the extracted rows.
+    const startMarker = items.find(it => /^transaction\s*history$/i.test(it.text));
+    const endMarker = items.find(it => PDF_SECTION_END_RE.test(it.text));
+    let scoped = items;
+    if (startMarker) scoped = scoped.filter(it => posOf(it) >= posOf(startMarker));
+    if (endMarker) scoped = scoped.filter(it => posOf(it) < posOf(endMarker));
+
+    const dateAnchors = scoped.filter(it => DATE_RE.test(it.text))
+      .sort((a, b) => a.page !== b.page ? a.page - b.page : a.y - b.y);
+    if (dateAnchors.length < 3) return null;
+
+    const nonDateItems = scoped.filter(it => !DATE_RE.test(it.text) && !/^null$/i.test(it.text));
+    const dateSet = new Set(dateAnchors);
+    const all = [...dateAnchors, ...nonDateItems].sort((a, b) =>
+      a.page !== b.page ? a.page - b.page : a.y !== b.y ? a.y - b.y : a.x - b.x
+    );
+    const anchorIndexByRef = new Map(dateAnchors.map((d, i) => [d, i]));
+
+    const blocks = dateAnchors.map(() => []);
+    let currentAnchor = -1;
+    const LOOKAHEAD_PX = 20;
+    for (let i = 0; i < all.length; i++) {
+      const it = all[i];
+      if (dateSet.has(it)) { currentAnchor = anchorIndexByRef.get(it); continue; }
+      let nextAnchor = null;
+      for (let j = i + 1; j < all.length; j++) {
+        if (dateSet.has(all[j])) { nextAnchor = all[j]; break; }
+      }
+      if (nextAnchor && nextAnchor.page === it.page && nextAnchor.y - it.y >= 0 && nextAnchor.y - it.y <= LOOKAHEAD_PX) {
+        // Merchant name a few px above its own row's date, same page.
+        blocks[anchorIndexByRef.get(nextAnchor)].push(it);
+      } else if (nextAnchor && nextAnchor.page > it.page) {
+        // Trailing content at the bottom of a page with no further date
+        // anchor before the page ends — head of a row split across pages.
+        blocks[anchorIndexByRef.get(nextAnchor)].push(it);
+      } else if (currentAnchor !== -1) {
+        const anchor = dateAnchors[currentAnchor];
+        if (it.page - anchor.page <= 1) blocks[currentAnchor].push(it);
+      }
+    }
+
+    // Column zones from natural gaps in x (>30px) across everything that
+    // actually landed in a block — not hardcoded, so this adapts per statement.
+    const xs = [...new Set(blocks.flat().map(it => it.x))].sort((a, b) => a - b);
+    const bounds = [];
+    for (let i = 1; i < xs.length; i++) if (xs[i] - xs[i - 1] > 30) bounds.push((xs[i] + xs[i - 1]) / 2);
+    const zoneOf = (x) => bounds.filter(b => b < x).length;
+
+    const tagKeys = new Set(Object.keys(PDF_CATEGORY_TAG_MAP));
+    const prelim = dateAnchors.map((dateAnchor, i) => {
+      const blockItems = blocks[i];
+      if (blockItems.length === 0) return null;
+      const lineText = blockItems.map(it => it.text).join(" ");
+      if (PDF_SKIP_TAG_RE.test(lineText.trim()) || /paid via/i.test(lineText)) return null;
+
+      const zones = blockItems.map(it => zoneOf(it.x));
+      const minZone = Math.min(...zones), maxZone = Math.max(...zones);
+      const merchantCandidates = blockItems
+        .filter(it => zoneOf(it.x) === minZone && !PDF_NOISE_RE.test(it.text))
+        .sort((a, b) => a.y - b.y);
+      const description = merchantCandidates[0]?.text.trim() || "";
+      const amountCandidates = blockItems
+        .filter(it => zoneOf(it.x) === maxZone && AMOUNT_RE.test(it.text.replace(/,/g, "")))
+        .sort((a, b) => a.y - b.y);
+      const amount = amountCandidates.length ? (parseFloat(amountCandidates[0].text.replace(/,/g, "")) || 0) : null;
+      const tagMatch = Object.keys(PDF_CATEGORY_TAG_MAP).find(tag =>
+        new RegExp(tag.replace(/[&/]/g, m => "\\" + m), "i").test(lineText)
+      );
+      const dateStr = toIsoDate(dateAnchor.text, monthYearMap);
+      return dateStr ? { date: dateStr, description, amount, tagMatch } : null;
+    });
+
+    const rows = [];
+    let pendingDesc = null;
+    prelim.forEach((p, i) => {
+      if (!p) return;
+      if (p.amount === null) { if (p.description) pendingDesc = p.description; return; }
+      let description = p.description;
+      const descIsTagLike = description && tagKeys.has(description.toLowerCase());
+      if ((!description || descIsTagLike) && pendingDesc) description = pendingDesc;
+      if (!description || p.amount <= 0) return;
+      pendingDesc = null;
+      const category = p.tagMatch ? PDF_CATEGORY_TAG_MAP[p.tagMatch] : categorise(description, "expense");
+      rows.push({
+        id: "pdf-stacked-" + i + "-" + Date.now(),
+        date: p.date,
+        type: "expense",
+        amount: p.amount,
+        currency: detectedCurrency,
+        description,
+        category,
+        _selected: true,
+      });
+    });
+
+    return rows.length > 0 ? rows : null;
+  }
+
   function parsePdfItems(items) {
     // ── Step 0: Detect statement currency from header text ──
     const allText = items.map(it => it.text).join(" ");
@@ -1694,6 +1835,19 @@ export default function App() {
     const hasCurrencyCol = /\b(AED|INR|USD)\b/.test(allText) &&
       items.some(it => ["AED","INR","USD"].includes(it.text.toUpperCase()));
 
+    // Some statements (this OneCard-style layout in particular) print the
+    // merchant name, its "Forex Fee = X" / "GST @ Y%" sub-notes, and the
+    // amount+extraction-artifact trio as separate visual sub-lines that
+    // don't share a close-enough y-position to cluster into one "line" the
+    // way the generic parser below expects — attempting that here either
+    // strands the merchant name in its own orphan line (empty description)
+    // or merges in the wrong stray number as the amount. When we detect the
+    // telltale "Forex Fee = " / "GST @ ...%" notes repeated throughout,
+    // switch to a block-based reconstruction instead.
+    if (/forex\s*fee\s*=|gst\s*@\s*\d/i.test(allText)) {
+      const stacked = parseStackedPdfRows(items, monthYearMap, detectedCurrency);
+      if (stacked && stacked.length > 0) return { rows: stacked, detectedCurrency };
+    }
 
     const lines = [];
     const sorted = [...items].sort((a, b) => a.page !== b.page ? a.page - b.page : a.y !== b.y ? a.y - b.y : a.x - b.x);
