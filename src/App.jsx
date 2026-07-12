@@ -17,7 +17,13 @@ const DEFAULT_INCOME_CATEGORIES = ["Salary", "Bonus", "Dividends", "Interest", "
 // Standardized against what a typical individual actually tracks: added
 // Transport (daily commute/rideshare/fuel, distinct from Travel = trips),
 // Entertainment, and Subscriptions alongside the original set.
-const DEFAULT_EXPENSE_CATEGORIES = ["Rent", "Groceries", "Transport", "Utilities", "Dining", "Entertainment", "Travel", "Shopping", "Healthcare", "Insurance", "Subscriptions", "Investment Fees", "Other Expense"];
+const DEFAULT_EXPENSE_CATEGORIES = ["Rent", "Groceries", "Transport", "Utilities", "Dining", "Entertainment", "Travel", "Shopping", "Healthcare", "Insurance", "Subscriptions", "Investment Fees", "Debt Repayment", "Other Expense"];
+// Categories that are real transactions (and correctly count in cash flow /
+// net worth) but shouldn't double up in category-level spend insight —
+// e.g. paying a friend back for an IOU that was already counted as spend
+// on the day it was incurred. Category-insight views (expenseByCategory,
+// budgetActuals) skip these; the transaction ledger itself still shows them.
+const NON_SPEND_CATEGORIES = ["Debt Repayment"];
 // Any categories added to the standard set after a user's data already
 // existed get merged in (without touching anything they've customized)
 // — see the load effect below.
@@ -318,12 +324,29 @@ export default function App() {
   const [toast, setToast] = useState(null);
   const [txForm, setTxForm] = useState({ date: new Date().toISOString().slice(0,10), type: "income", category: "Salary", description: "", amount: "", currency: "INR" });
   const [editingTx, setEditingTx] = useState(null);
+  const [splittingTx, setSplittingTx] = useState(null); // tx id currently being split
+  const [splitDraft, setSplitDraft] = useState({ people: [{ person: "", amount: "" }] });
   const [cashFlowFilter, setCashFlowFilter] = useState("all"); // all | income | expense
   const [monthFilter, setMonthFilter] = useState("all"); // all | YYYY-MM
   const [catMonthFilter, setCatMonthFilter] = useState("all"); // for the expense/income by category charts
   const [txSearch, setTxSearch] = useState("");
   const [txCatFilter, setTxCatFilter] = useState("all"); // all | <category name>
   const [txView, setTxView] = useState("list"); // list | byCategory
+
+  // ---- IOUs (shared/reimbursable expenses not fully reflected in imported transactions) ----
+  // {id, date, person, direction: 'they_paid'|'i_paid', description, origAmount, currency,
+  //  fxRateAtDate, amount (INR), category, countInSpend, status: 'outstanding'|'settled', settledDate, notes}
+  // 'they_paid' = someone else paid on my behalf -> I owe them.
+  // 'i_paid'    = I paid on someone else's behalf -> they owe me.
+  const [ious, setIous] = useState([]);
+  const [iouForm, setIouForm] = useState({
+    date: new Date().toISOString().slice(0, 10), person: "", direction: "they_paid",
+    description: "", amount: "", currency: "AED", category: DEFAULT_EXPENSE_CATEGORIES[0],
+    countInSpend: true, notes: "",
+  });
+  const [editingIou, setEditingIou] = useState(null);
+  const [iouPersonFilter, setIouPersonFilter] = useState("all");
+  const [iouStatusFilter, setIouStatusFilter] = useState("outstanding"); // outstanding | settled | all
 
   // load from storage
   useEffect(() => {
@@ -374,6 +397,7 @@ export default function App() {
             setAssetClassOptions(merged);
           }
           if (parsed.budgets) setBudgets(parsed.budgets);
+          if (parsed.ious) setIous(parsed.ious);
         } else if (res.status === "empty") {
           // Genuinely new account: seed a few common starter holdings
           // (zero balance) so the Net Worth / Categories screens aren't
@@ -404,7 +428,7 @@ export default function App() {
     const save = async () => {
       setSaveStatus("saving");
       try {
-        const res = await window.storage.set("data", JSON.stringify({ snapshots, categories, costBasis, classMap, transactions, displayCurrency, fxRates, categoryRules, incomeCategories, expenseCategories, assetClassOptions, budgets }), false);
+        const res = await window.storage.set("data", JSON.stringify({ snapshots, categories, costBasis, classMap, transactions, displayCurrency, fxRates, categoryRules, incomeCategories, expenseCategories, assetClassOptions, budgets, ious }), false);
         if (res === null) {
           setSaveStatus("error");
         } else {
@@ -416,7 +440,7 @@ export default function App() {
       }
     };
     save();
-  }, [snapshots, categories, costBasis, classMap, transactions, displayCurrency, fxRates, categoryRules, incomeCategories, expenseCategories, assetClassOptions, budgets, loaded]);
+  }, [snapshots, categories, costBasis, classMap, transactions, displayCurrency, fxRates, categoryRules, incomeCategories, expenseCategories, assetClassOptions, budgets, ious, loaded]);
 
   // ---- Manual backup (export/import JSON) ----
   // Encrypted with the same in-memory session key used for the Supabase
@@ -426,7 +450,7 @@ export default function App() {
   // when there's genuinely no encryption key to use (offline mode with
   // no Supabase configured, i.e. no account/passphrase system at all).
   async function exportBackup() {
-    const data = { snapshots, categories, costBasis, classMap, transactions, displayCurrency, fxRates, categoryRules, incomeCategories, expenseCategories, assetClassOptions, budgets, exportedAt: new Date().toISOString() };
+    const data = { snapshots, categories, costBasis, classMap, transactions, displayCurrency, fxRates, categoryRules, incomeCategories, expenseCategories, assetClassOptions, budgets, ious, exportedAt: new Date().toISOString() };
     const encrypted = !!encryptionKey;
     const json = encrypted
       ? JSON.stringify(await encryptPayload(encryptionKey, data), null, 2)
@@ -483,6 +507,8 @@ export default function App() {
         if (parsed.incomeCategories) setIncomeCategories(parsed.incomeCategories);
         if (parsed.expenseCategories) setExpenseCategories(parsed.expenseCategories);
         if (parsed.assetClassOptions) setAssetClassOptions(parsed.assetClassOptions);
+        if (parsed.budgets) setBudgets(parsed.budgets);
+        if (parsed.ious) setIous(parsed.ious);
         showToast("Backup restored");
       } catch (err) {
         showToast("Couldn't read that file");
@@ -681,25 +707,73 @@ export default function App() {
   const fmtDisp = (n) => fmtMoney(Number(n) || 0, displayCurrency, cur.symbol);
   const fmtDispCompact = (n) => fmtCompactCur(Number(n) || 0, cur.symbol);
 
-  // txInr(t): transaction amount in INR using the best available rate
+  // txInr(t): transaction amount in INR using the best available rate.
+  // If the transaction has a split set (t.split.myShare), that share — not
+  // the full imported amount — is what counts as "my" spend everywhere:
+  // category totals, budgets, cash flow, and the net worth savings line.
+  // The full amount is still preserved on t.origAmount/t.amount for
+  // reconciliation against the statement it was imported from.
   const txInr = (t) => {
-    if ((t.currency || "INR") === "INR") return Number(t.origAmount ?? t.amount) || 0;
+    const myOrig = t.split ? (Number(t.split.myShare) || 0) : (Number(t.origAmount ?? t.amount) || 0);
+    if ((t.currency || "INR") === "INR") return myOrig;
     const rate = t.fxRateAtDate || t.fxRatesAtEntry?.[t.currency] || fxRates[t.currency] || DEFAULT_FX_TO_INR[t.currency] || 1;
-    return (Number(t.origAmount ?? t.amount) || 0) * rate;
+    return myOrig * rate;
   };
 
-  // txDisplay(t): transaction amount in the current display currency,
-  // converted using the rate AS OF the transaction's own date — not
-  // today's rate, which would otherwise silently distort old transactions
-  // every time the exchange rate moves (e.g. a Jan 2025 grocery run would
-  // keep changing in USD terms as USD/INR moves through 2026).
+  // txDisplay(t): transaction amount (my share, if split) in the current
+  // display currency, converted using the rate AS OF the transaction's own
+  // date — not today's rate, which would otherwise silently distort old
+  // transactions every time the exchange rate moves (e.g. a Jan 2025
+  // grocery run would keep changing in USD terms as USD/INR moves through
+  // 2026).
   const txDisplay = (t) => {
+    const myOrig = t.split ? (Number(t.split.myShare) || 0) : (Number(t.origAmount ?? t.amount) || 0);
     if (displayCurrency === "INR") return txInr(t);
-    if (t.currency === displayCurrency) return Number(t.origAmount ?? t.amount) || 0;
+    if (t.currency === displayCurrency) return myOrig;
     return txInr(t) / historicalRate(t.date, displayCurrency);
   };
 
   const fmtTx = (t) => fmtMoney(txDisplay(t), displayCurrency, cur.symbol);
+
+  // ---- IOU helpers (mirror the tx equivalents above) ----
+  function buildIouRecord({ date, person, direction, description, origAmount, currency, category, countInSpend, notes }) {
+    const fxRateAtDate = historicalRate(date, currency);
+    const inrAmount = (origAmount || 0) * fxRateAtDate;
+    return { date, person, direction, description, origAmount, currency, fxRateAtDate, amount: inrAmount, category, countInSpend, notes };
+  }
+  const iouInr = (i) => {
+    if ((i.currency || "INR") === "INR") return Number(i.origAmount ?? i.amount) || 0;
+    const rate = i.fxRateAtDate || fxRates[i.currency] || DEFAULT_FX_TO_INR[i.currency] || 1;
+    return (Number(i.origAmount ?? i.amount) || 0) * rate;
+  };
+  const iouDisplay = (i) => {
+    if (displayCurrency === "INR") return iouInr(i);
+    if (i.currency === displayCurrency) return Number(i.origAmount ?? i.amount) || 0;
+    return iouInr(i) / historicalRate(i.date, displayCurrency);
+  };
+  const fmtIou = (i) => fmtMoney(iouDisplay(i), displayCurrency, cur.symbol);
+
+  // ---- Shared inputs for every flow-based calc below (cash flow, budgets,
+  // net worth savings baseline, XIRR, wealth created) ----
+  // Philosophy: income - true attributable expenses = savings, which then
+  // gets deployed into brokerage (captured by net worth snapshots) or lent
+  // out to friends (an IOU asset, tracked manually in net worth, not here).
+  //  - "they paid for me" IOUs marked countInSpend ARE a true expense (you
+  //    consumed the value on that date, whether or not you've settled up) —
+  //    so they flow into income/expense/savings alongside real transactions.
+  //  - "i paid for them" IOUs are NOT an expense — that money is just
+  //    savings converted into a loan/receivable, same as buying a stock.
+  //  - Debt Repayment transactions (you paying someone back) are excluded
+  //    here too, since the real expense was already recognized when the
+  //    IOU was incurred — counting the repayment again would double it.
+  const spendTransactions = useMemo(
+    () => transactions.filter(t => !(t.type === "expense" && NON_SPEND_CATEGORIES.includes(t.category))),
+    [transactions]
+  );
+  const iouSpendEntries = useMemo(
+    () => ious.filter(i => i.direction === "they_paid" && i.countInSpend),
+    [ious]
+  );
 
   // totals: each row converted using THAT snapshot's own FX rates (rate as of that date)
   // Also includes a "savingsBaseline" = starting NW + cumulative net savings up to that date
@@ -708,7 +782,7 @@ export default function App() {
     // Note: we treat credits on expense categories as negative expenses (refunds),
     // not as income, to avoid credit card refunds/cashbacks inflating savings.
     const monthlySavingsInr = {};
-    transactions.forEach(t => {
+    spendTransactions.forEach(t => {
       const m = t.date.slice(0, 7);
       if (!monthlySavingsInr[m]) monthlySavingsInr[m] = 0;
       const amtInr = txInr(t);
@@ -716,6 +790,10 @@ export default function App() {
       // Credit card credits (refunds, cashbacks, payments received) are NOT income
       if (t.type === "income") monthlySavingsInr[m] += amtInr;
       else monthlySavingsInr[m] -= amtInr;
+    });
+    iouSpendEntries.forEach(i => {
+      const m = i.date.slice(0, 7);
+      monthlySavingsInr[m] = (monthlySavingsInr[m] || 0) - iouInr(i);
     });
     const sortedMonths = Object.keys(monthlySavingsInr).sort();
 
@@ -740,7 +818,7 @@ export default function App() {
 
       return row;
     });
-  }, [sortedSnapshots, categories, displayCurrency, fxRates, transactions]);
+  }, [sortedSnapshots, categories, displayCurrency, fxRates, spendTransactions, iouSpendEntries]);
 
   const latestTotalInr = latest ? categories.reduce((sum, c) => sum + (Number(latest.values[c]) || 0), 0) : 0;
   const prevTotalInr = previous ? categories.reduce((sum, c) => sum + (Number(previous.values[c]) || 0), 0) : 0;
@@ -809,12 +887,18 @@ export default function App() {
     // converted to display currency using each transaction's own date
     // (txDisplay already does date-appropriate conversion).
     const monthlyMap = {}; // "YYYY-MM" -> net savings in display currency
-    transactions.forEach(t => {
+    spendTransactions.forEach(t => {
       const d = new Date(t.date);
       if (d < startDate || d > endDate) return;
       const m = t.date.slice(0, 7);
       const amtDisp = txDisplay(t);
       monthlyMap[m] = (monthlyMap[m] || 0) + (t.type === "income" ? amtDisp : -amtDisp);
+    });
+    iouSpendEntries.forEach(i => {
+      const d = new Date(i.date);
+      if (d < startDate || d > endDate) return;
+      const m = i.date.slice(0, 7);
+      monthlyMap[m] = (monthlyMap[m] || 0) - iouDisplay(i);
     });
 
     // Each month's net savings becomes a dated flow
@@ -840,21 +924,26 @@ export default function App() {
 
     const rate = xirr(flows);
     return isFinite(rate) && rate > -1 ? rate : null;
-  }, [sortedSnapshots, categories, transactions, latestTotal, displayCurrency, fxRates]);
+  }, [sortedSnapshots, categories, spendTransactions, iouSpendEntries, latestTotal, displayCurrency, fxRates]);
 
   // Monthly net savings (for display — in display currency)
   const monthlySavings = useMemo(() => {
     const map = {};
-    transactions.forEach(t => {
+    spendTransactions.forEach(t => {
       const m = t.date.slice(0, 7);
       if (!map[m]) map[m] = { month: m, income: 0, expense: 0, savings: 0 };
       const val = txDisplay(t);
       if (t.type === "income") map[m].income += val;
       else map[m].expense += val;
     });
+    iouSpendEntries.forEach(i => {
+      const m = i.date.slice(0, 7);
+      if (!map[m]) map[m] = { month: m, income: 0, expense: 0, savings: 0 };
+      map[m].expense += iouDisplay(i);
+    });
     Object.values(map).forEach(r => { r.savings = r.income - r.expense; });
     return Object.values(map).sort((a, b) => a.month.localeCompare(b.month));
-  }, [transactions, displayCurrency, fxRates]);
+  }, [spendTransactions, iouSpendEntries, displayCurrency, fxRates]);
 
   const cumulativeSavings = useMemo(() =>
     monthlySavings.reduce((sum, m) => sum + m.savings, 0),
@@ -875,12 +964,19 @@ export default function App() {
   // no independent growth between them to measure, yet every bit of
   // lifetime savings still got subtracted from it.
   function sumSavingsBetween(startDateInclusive, endDateInclusive) {
-    return transactions.reduce((sum, t) => {
+    const txSum = spendTransactions.reduce((sum, t) => {
       const d = new Date(t.date);
       if (startDateInclusive && d < startDateInclusive) return sum;
       if (endDateInclusive && d > endDateInclusive) return sum;
       return sum + (t.type === "income" ? txDisplay(t) : -txDisplay(t));
     }, 0);
+    const iouSum = iouSpendEntries.reduce((sum, i) => {
+      const d = new Date(i.date);
+      if (startDateInclusive && d < startDateInclusive) return sum;
+      if (endDateInclusive && d > endDateInclusive) return sum;
+      return sum - iouDisplay(i);
+    }, 0);
+    return txSum + iouSum;
   }
 
   const firstSnapDate = sortedSnapshots[0] ? parseFlexDate(sortedSnapshots[0].date) : null;
@@ -960,15 +1056,103 @@ export default function App() {
 
   // ---- Budget derived data ----
   const budgetActuals = useMemo(() => {
-    // Actual spend per expense category for the selected budget month
+    // Actual spend per expense category for the selected budget month —
+    // uses the same inputs as totalExpense/monthlySavings so this always
+    // reconciles with the headline numbers.
     const map = {};
-    transactions
+    spendTransactions
       .filter(t => t.type === "expense" && t.date.slice(0, 7) === budgetMonth)
       .forEach(t => {
         map[t.category] = (map[t.category] || 0) + txDisplay(t);
       });
+    iouSpendEntries
+      .filter(i => i.category && i.date.slice(0, 7) === budgetMonth)
+      .forEach(i => {
+        map[i.category] = (map[i.category] || 0) + iouDisplay(i);
+      });
     return map;
-  }, [transactions, budgetMonth, displayCurrency, fxRates]);
+  }, [spendTransactions, iouSpendEntries, budgetMonth, displayCurrency, fxRates]);
+
+  // ---- IOU derived data ----
+  const iouPeople = useMemo(() => {
+    const set = new Set(ious.map(i => i.person).filter(Boolean));
+    return Array.from(set).sort();
+  }, [ious]);
+
+  const iouBalances = useMemo(() => {
+    const map = {};
+    ious.forEach(i => {
+      if (i.status !== "outstanding" || !i.person) return;
+      if (!map[i.person]) map[i.person] = { person: i.person, theyOwe: 0, iOwe: 0 };
+      const disp = iouDisplay(i);
+      if (i.direction === "i_paid") map[i.person].theyOwe += disp; // they owe me
+      else map[i.person].iOwe += disp; // I owe them
+    });
+    return Object.values(map)
+      .map(b => ({ ...b, net: b.theyOwe - b.iOwe }))
+      .sort((a, b) => Math.abs(b.net) - Math.abs(a.net));
+  }, [ious, displayCurrency, fxRates]);
+
+  const totalTheyOweMe = iouBalances.reduce((s, b) => s + b.theyOwe, 0);
+  const totalIOweThem = iouBalances.reduce((s, b) => s + b.iOwe, 0);
+
+  const filteredIous = useMemo(() => {
+    return [...ious]
+      .filter(i => iouPersonFilter === "all" || i.person === iouPersonFilter)
+      .filter(i => iouStatusFilter === "all" || i.status === iouStatusFilter)
+      .sort((a, b) => new Date(b.date) - new Date(a.date));
+  }, [ious, iouPersonFilter, iouStatusFilter]);
+
+  function addOrUpdateIou() {
+    if (!iouForm.person.trim()) { showToast("Enter who this is with"); return; }
+    if (!iouForm.amount || isNaN(Number(iouForm.amount))) { showToast("Enter a valid amount"); return; }
+    const origAmount = Number(iouForm.amount);
+    const record = buildIouRecord({
+      date: iouForm.date, person: iouForm.person.trim(), direction: iouForm.direction,
+      description: iouForm.description, origAmount, currency: iouForm.currency || "AED",
+      category: iouForm.countInSpend ? iouForm.category : "", countInSpend: iouForm.countInSpend,
+      notes: iouForm.notes,
+    });
+    if (editingIou) {
+      setIous(prev => prev.map(i => i.id === editingIou ? { ...i, ...record } : i));
+      setEditingIou(null);
+      showToast("IOU updated");
+    } else {
+      setIous(prev => [...prev, { id: "iou-" + Date.now(), status: "outstanding", settledDate: null, ...record }]);
+      showToast("IOU added");
+    }
+    setIouForm(f => ({ ...f, person: "", description: "", amount: "", notes: "" }));
+  }
+
+  function startEditIou(i) {
+    setEditingIou(i.id);
+    setIouForm({
+      date: i.date, person: i.person, direction: i.direction, description: i.description || "",
+      amount: String(i.origAmount ?? i.amount), currency: i.currency || "AED",
+      category: i.category || DEFAULT_EXPENSE_CATEGORIES[0], countInSpend: !!i.countInSpend, notes: i.notes || "",
+    });
+  }
+
+  function cancelEditIou() {
+    setEditingIou(null);
+    setIouForm({
+      date: new Date().toISOString().slice(0, 10), person: "", direction: "they_paid",
+      description: "", amount: "", currency: "AED", category: DEFAULT_EXPENSE_CATEGORIES[0],
+      countInSpend: true, notes: "",
+    });
+  }
+
+  function deleteIou(id) {
+    setIous(prev => prev.filter(i => i.id !== id));
+    if (editingIou === id) cancelEditIou();
+    showToast("IOU removed");
+  }
+
+  function toggleIouSettled(id) {
+    setIous(prev => prev.map(i => i.id === id
+      ? { ...i, status: i.status === "outstanding" ? "settled" : "outstanding", settledDate: i.status === "outstanding" ? new Date().toISOString().slice(0, 10) : null }
+      : i));
+  }
 
   const budgetTotalBudgeted = expenseCategories.reduce((s, c) => s + (Number(budgets[c]) || 0), 0);
   const budgetTotalActual = expenseCategories.reduce((s, c) => s + (budgetActuals[c] || 0), 0);
@@ -992,7 +1176,11 @@ export default function App() {
   }, [filteredTx, displayCurrency, fxRates]);
 
   const totalIncome = useMemo(() => transactions.filter(t => t.type === "income").reduce((s, t) => s + txDisplay(t), 0), [transactions, displayCurrency, fxRates]);
-  const totalExpense = useMemo(() => transactions.filter(t => t.type === "expense").reduce((s, t) => s + txDisplay(t), 0), [transactions, displayCurrency, fxRates]);
+  const totalExpense = useMemo(() => {
+    const txTotal = spendTransactions.filter(t => t.type === "expense").reduce((s, t) => s + txDisplay(t), 0);
+    const iouTotal = iouSpendEntries.reduce((s, i) => s + iouDisplay(i), 0);
+    return txTotal + iouTotal;
+  }, [spendTransactions, iouSpendEntries, displayCurrency, fxRates]);
   const netCashFlow = totalIncome - totalExpense; // = total savings
 
   const thisMonthKey = new Date().toISOString().slice(0, 7);
@@ -1000,13 +1188,21 @@ export default function App() {
 
   const expenseByCategory = useMemo(() => {
     const map = {};
-    transactions
+    spendTransactions
       .filter(t => t.type === "expense" && (catMonthFilter === "all" || t.date.slice(0, 7) === catMonthFilter))
       .forEach(t => {
         map[t.category] = (map[t.category] || 0) + txDisplay(t);
       });
+    // "They paid for me" IOUs marked as spend — same inputs as
+    // totalExpense/monthlySavings, so this chart always sums to the
+    // Total Expenses figure shown elsewhere.
+    iouSpendEntries
+      .filter(i => i.category && (catMonthFilter === "all" || i.date.slice(0, 7) === catMonthFilter))
+      .forEach(i => {
+        map[i.category] = (map[i.category] || 0) + iouDisplay(i);
+      });
     return Object.entries(map).map(([name, value]) => ({ name, value })).sort((a, b) => b.value - a.value);
-  }, [transactions, displayCurrency, fxRates, catMonthFilter]);
+  }, [spendTransactions, iouSpendEntries, displayCurrency, fxRates, catMonthFilter]);
 
   const incomeByCategory = useMemo(() => {
     const map = {};
@@ -1055,7 +1251,103 @@ export default function App() {
   function deleteTx(id) {
     setTransactions(prev => prev.filter(t => t.id !== id));
     if (editingTx === id) cancelEditTx();
+    if (splittingTx === id) cancelSplitTx();
+    setIous(prev => prev.filter(i => i.linkedTxId !== id));
     showToast("Transaction removed");
+  }
+
+  // ---- Split an existing transaction (e.g. rent paid in full, but only
+  // part of it is really your expense) ----
+  // t.split = { myShare: <in t.currency>, otherShares: [{person, amount}] }
+  // Each otherShare auto-creates/updates a linked IOU (direction "i_paid" —
+  // you paid the full amount, they owe you their part), tagged with
+  // linkedTxId so it tracks the split rather than living as a separate
+  // disconnected entry. countInSpend is left off for these by default:
+  // the transaction's own myShare already IS the corrected spend, so
+  // flipping the linked IOU's toggle on too would double count it.
+  function startSplitTx(t) {
+    setEditingTx(null);
+    setSplittingTx(t.id);
+    if (t.split?.otherShares?.length) {
+      setSplitDraft({ people: t.split.otherShares.map(s => ({ person: s.person, amount: String(s.amount) })) });
+    } else {
+      setSplitDraft({ people: [{ person: "", amount: "" }] });
+    }
+  }
+
+  function cancelSplitTx() {
+    setSplittingTx(null);
+    setSplitDraft({ people: [{ person: "", amount: "" }] });
+  }
+
+  function updateSplitPerson(idx, field, value) {
+    setSplitDraft(d => ({ people: d.people.map((p, i) => i === idx ? { ...p, [field]: value } : p) }));
+  }
+
+  function addSplitPersonRow() {
+    setSplitDraft(d => ({ people: [...d.people, { person: "", amount: "" }] }));
+  }
+
+  function removeSplitPersonRow(idx) {
+    setSplitDraft(d => ({ people: d.people.filter((_, i) => i !== idx) }));
+  }
+
+  function clearSplitTx(t) {
+    setIous(prev => prev.filter(i => i.linkedTxId !== t.id));
+    setTransactions(prev => prev.map(tx => {
+      if (tx.id !== t.id) return tx;
+      const { split, ...rest } = tx;
+      return rest;
+    }));
+    setSplittingTx(null);
+    showToast("Split removed — full amount counts as your spend again");
+  }
+
+  function saveSplitTx(t) {
+    const validPeople = splitDraft.people
+      .filter(p => p.person.trim() && p.amount !== "" && !isNaN(Number(p.amount)) && Number(p.amount) > 0)
+      .map(p => ({ person: p.person.trim(), amount: Number(p.amount) }));
+
+    if (validPeople.length === 0) { clearSplitTx(t); return; }
+
+    const origTotal = Number(t.origAmount ?? t.amount) || 0;
+    const othersTotal = validPeople.reduce((s, p) => s + p.amount, 0);
+    const myShare = origTotal - othersTotal;
+    if (myShare < 0) { showToast("Those shares add up to more than the transaction total"); return; }
+
+    const rate = t.fxRateAtDate || historicalRate(t.date, t.currency || "INR");
+
+    setIous(prevIous => {
+      const keptPeople = new Set();
+      let next = prevIous
+        .map(i => {
+          if (i.linkedTxId !== t.id) return i;
+          const match = validPeople.find(p => p.person === i.person);
+          if (!match) return null; // person removed from split — drop the linked IOU
+          keptPeople.add(match.person);
+          return { ...i, origAmount: match.amount, amount: match.amount * rate, currency: t.currency || "INR", date: t.date };
+        })
+        .filter(Boolean);
+      validPeople.filter(p => !keptPeople.has(p.person)).forEach(p => {
+        next.push({
+          id: "iou-" + Date.now() + "-" + Math.random().toString(36).slice(2, 7),
+          date: t.date, person: p.person, direction: "i_paid",
+          description: t.description || t.category, origAmount: p.amount, currency: t.currency || "INR",
+          fxRateAtDate: rate, amount: p.amount * rate,
+          category: "", countInSpend: false,
+          notes: `Auto-linked — their share of "${t.description || t.category}"`,
+          status: "outstanding", settledDate: null, linkedTxId: t.id,
+        });
+      });
+      return next;
+    });
+
+    setTransactions(prev => prev.map(tx => tx.id === t.id
+      ? { ...tx, split: { myShare, otherShares: validPeople } }
+      : tx));
+
+    setSplittingTx(null);
+    showToast("Split saved");
   }
 
   async function refreshHistoricalRates() {
@@ -2611,6 +2903,7 @@ export default function App() {
           ["history", "History"],
           ["cashflow", "Cash Flow"],
           ["budget", "Budget"],
+          ["owed", "IOUs"],
           ["data", "Edit Data"],
           ["categories", "Categories"],
           ["security", "Security"],
@@ -3481,8 +3774,10 @@ export default function App() {
                           <tbody>
                             {group.txs.map(t => {
                               const isEditing = editingTx === t.id;
+                              const isSplitting = splittingTx === t.id;
                               return (
-                                <tr key={t.id} style={{ background: isEditing ? "#faf6f0" : "transparent" }}>
+                                <React.Fragment key={t.id}>
+                                <tr style={{ background: isEditing ? "#faf6f0" : isSplitting ? "#f4f7f5" : "transparent" }}>
                                   <td style={{ textAlign: "left" }}>
                                     {isEditing ? <input className="num-input" type="date" style={{ width: 130 }} value={txForm.date} onChange={e => setTxForm(f => ({ ...f, date: e.target.value }))} />
                                       : <span style={{ fontSize: 13 }}>{t.date}</span>}
@@ -3493,7 +3788,14 @@ export default function App() {
                                   </td>
                                   <td>
                                     {isEditing ? <input className="num-input" type="number" style={{ width: 100 }} value={txForm.amount} onChange={e => setTxForm(f => ({ ...f, amount: e.target.value }))} />
-                                      : <span style={{ fontFamily: "'JetBrains Mono', monospace", fontWeight: 600, fontSize: 13, color: t.type === "income" ? "#5f8d6b" : "#b5685a" }}>{t.type === "income" ? "+" : "−"}{fmtTx(t)}</span>}
+                                      : <span style={{ fontFamily: "'JetBrains Mono', monospace", fontWeight: 600, fontSize: 13, color: t.type === "income" ? "#5f8d6b" : "#b5685a" }}>
+                                          {t.type === "income" ? "+" : "−"}{fmtTx(t)}
+                                          {t.split && (
+                                            <div style={{ fontSize: 11, color: "#5b7c99", fontWeight: 400 }}>
+                                              split · full {CURRENCIES[t.currency || "INR"]?.symbol}{Math.round(t.origAmount ?? t.amount).toLocaleString("en-IN")}
+                                            </div>
+                                          )}
+                                        </span>}
                                   </td>
                                   <td style={{ textAlign: "left" }}>
                                     {isEditing ? <select className="num-input" style={{ width: 80 }} value={txForm.currency} onChange={e => setTxForm(f => ({ ...f, currency: e.target.value }))}>{Object.keys(CURRENCIES).map(c => <option key={c}>{c}</option>)}</select>
@@ -3502,11 +3804,51 @@ export default function App() {
                                   <td style={{ whiteSpace: "nowrap" }}>
                                     {isEditing ? (
                                       <><button className="btn-icon" style={{ color: "#5f8d6b", fontWeight: 600 }} onClick={addOrUpdateTx}>Save</button><button className="btn-icon" onClick={cancelEditTx}>Cancel</button></>
+                                    ) : isSplitting ? (
+                                      <button className="btn-icon" onClick={cancelSplitTx}>Cancel</button>
                                     ) : (
-                                      <><button className="btn-icon" onClick={() => startEditTx(t)}>Edit</button><button className="btn-icon" onClick={() => deleteTx(t.id)}>✕</button></>
+                                      <>
+                                        <button className="btn-icon" onClick={() => startEditTx(t)}>Edit</button>
+                                        <button className="btn-icon" onClick={() => startSplitTx(t)}>{t.split ? "Edit split" : "Split"}</button>
+                                        <button className="btn-icon" onClick={() => deleteTx(t.id)}>✕</button>
+                                      </>
                                     )}
                                   </td>
                                 </tr>
+                                {isSplitting && (
+                                  <tr>
+                                    <td colSpan={5} style={{ background: "#f4f7f5", padding: "12px 16px" }}>
+                                      <div style={{ fontSize: 12, color: MUTED, marginBottom: 8 }}>
+                                        Full amount: {CURRENCIES[t.currency || "INR"]?.symbol}{Math.round(t.origAmount ?? t.amount).toLocaleString("en-IN")} {t.currency || "INR"}.
+                                        Enter what each other person owes — the rest becomes your share, and each entry auto-creates a linked IOU.
+                                      </div>
+                                      {splitDraft.people.map((p, idx) => (
+                                        <div key={idx} style={{ display: "flex", gap: 8, marginBottom: 6, alignItems: "center" }}>
+                                          <input className="num-input" style={{ width: 160 }} placeholder="Person" value={p.person} onChange={e => updateSplitPerson(idx, "person", e.target.value)} list="iou-people-list" />
+                                          <input className="num-input" type="number" style={{ width: 110 }} placeholder="Their share" value={p.amount} onChange={e => updateSplitPerson(idx, "amount", e.target.value)} />
+                                          <span style={{ fontSize: 12, color: MUTED }}>{t.currency || "INR"}</span>
+                                          <button className="btn-icon" onClick={() => removeSplitPersonRow(idx)}>✕</button>
+                                        </div>
+                                      ))}
+                                      <div style={{ display: "flex", gap: 8, alignItems: "center", marginTop: 8, flexWrap: "wrap" }}>
+                                        <button className="btn-ghost" onClick={addSplitPersonRow}>+ Add person</button>
+                                        {(() => {
+                                          const origTotal = Number(t.origAmount ?? t.amount) || 0;
+                                          const othersTotal = splitDraft.people.reduce((s, p) => s + (Number(p.amount) || 0), 0);
+                                          const myShare = origTotal - othersTotal;
+                                          return (
+                                            <span style={{ fontSize: 12, color: myShare < 0 ? "#b5685a" : "#5f8d6b", fontWeight: 600 }}>
+                                              Your share: {CURRENCIES[t.currency || "INR"]?.symbol}{Math.round(myShare).toLocaleString("en-IN")}
+                                            </span>
+                                          );
+                                        })()}
+                                        <button className="btn-primary" onClick={() => saveSplitTx(t)}>Save split</button>
+                                        {t.split && <button className="btn-ghost" onClick={() => clearSplitTx(t)}>Remove split</button>}
+                                      </div>
+                                    </td>
+                                  </tr>
+                                )}
+                                </React.Fragment>
                               );
                             })}
                           </tbody>
@@ -3541,8 +3883,10 @@ export default function App() {
                     <tbody>
                       {filteredTx.map(t => {
                         const isEditing = editingTx === t.id;
+                        const isSplitting = splittingTx === t.id;
                         return (
-                          <tr key={t.id} style={{ background: isEditing ? "#faf6f0" : "transparent" }}>
+                          <React.Fragment key={t.id}>
+                          <tr style={{ background: isEditing ? "#faf6f0" : isSplitting ? "#f4f7f5" : "transparent" }}>
                             <td style={{ textAlign: "left" }}>
                               {isEditing ? <input className="num-input" type="date" style={{ width: 130 }} value={txForm.date} onChange={e => setTxForm(f => ({ ...f, date: e.target.value }))} />
                                 : <span style={{ fontSize: 13 }}>{t.date}</span>}
@@ -3575,6 +3919,11 @@ export default function App() {
                                           : <span style={{ color: "#c97c5d" }} title="Rough default rate — click 'Fetch historical rates' to update"> · {t.fxRateAtDate?.toFixed(2)} est.</span>}
                                       </div>
                                     )}
+                                    {t.split && (
+                                      <div style={{ fontSize: 11, color: "#5b7c99", fontWeight: 400 }} title={t.split.otherShares.map(s => `${s.person}: ${CURRENCIES[t.currency || "INR"]?.symbol}${Math.round(s.amount).toLocaleString("en-IN")}`).join(", ")}>
+                                        split · full {CURRENCIES[t.currency || "INR"]?.symbol}{Math.round(t.origAmount ?? t.amount).toLocaleString("en-IN")}
+                                      </div>
+                                    )}
                                   </span>}
                             </td>
                             <td style={{ textAlign: "left" }}>
@@ -3584,11 +3933,51 @@ export default function App() {
                             <td style={{ whiteSpace: "nowrap" }}>
                               {isEditing ? (
                                 <><button className="btn-icon" style={{ color: "#5f8d6b", fontWeight: 600 }} onClick={addOrUpdateTx}>Save</button><button className="btn-icon" onClick={cancelEditTx}>Cancel</button></>
+                              ) : isSplitting ? (
+                                <button className="btn-icon" onClick={cancelSplitTx}>Cancel</button>
                               ) : (
-                                <><button className="btn-icon" onClick={() => startEditTx(t)}>Edit</button><button className="btn-icon" onClick={() => deleteTx(t.id)}>✕</button></>
+                                <>
+                                  <button className="btn-icon" onClick={() => startEditTx(t)}>Edit</button>
+                                  <button className="btn-icon" onClick={() => startSplitTx(t)}>{t.split ? "Edit split" : "Split"}</button>
+                                  <button className="btn-icon" onClick={() => deleteTx(t.id)}>✕</button>
+                                </>
                               )}
                             </td>
                           </tr>
+                          {isSplitting && (
+                            <tr>
+                              <td colSpan={7} style={{ background: "#f4f7f5", padding: "12px 16px" }}>
+                                <div style={{ fontSize: 12, color: MUTED, marginBottom: 8 }}>
+                                  Full amount: {CURRENCIES[t.currency || "INR"]?.symbol}{Math.round(t.origAmount ?? t.amount).toLocaleString("en-IN")} {t.currency || "INR"}.
+                                  Enter what each other person owes — the rest becomes your share, and each entry auto-creates a linked IOU.
+                                </div>
+                                {splitDraft.people.map((p, idx) => (
+                                  <div key={idx} style={{ display: "flex", gap: 8, marginBottom: 6, alignItems: "center" }}>
+                                    <input className="num-input" style={{ width: 160 }} placeholder="Person" value={p.person} onChange={e => updateSplitPerson(idx, "person", e.target.value)} list="iou-people-list" />
+                                    <input className="num-input" type="number" style={{ width: 110 }} placeholder="Their share" value={p.amount} onChange={e => updateSplitPerson(idx, "amount", e.target.value)} />
+                                    <span style={{ fontSize: 12, color: MUTED }}>{t.currency || "INR"}</span>
+                                    <button className="btn-icon" onClick={() => removeSplitPersonRow(idx)}>✕</button>
+                                  </div>
+                                ))}
+                                <div style={{ display: "flex", gap: 8, alignItems: "center", marginTop: 8, flexWrap: "wrap" }}>
+                                  <button className="btn-ghost" onClick={addSplitPersonRow}>+ Add person</button>
+                                  {(() => {
+                                    const origTotal = Number(t.origAmount ?? t.amount) || 0;
+                                    const othersTotal = splitDraft.people.reduce((s, p) => s + (Number(p.amount) || 0), 0);
+                                    const myShare = origTotal - othersTotal;
+                                    return (
+                                      <span style={{ fontSize: 12, color: myShare < 0 ? "#b5685a" : "#5f8d6b", fontWeight: 600 }}>
+                                        Your share: {CURRENCIES[t.currency || "INR"]?.symbol}{Math.round(myShare).toLocaleString("en-IN")}
+                                      </span>
+                                    );
+                                  })()}
+                                  <button className="btn-primary" onClick={() => saveSplitTx(t)}>Save split</button>
+                                  {t.split && <button className="btn-ghost" onClick={() => clearSplitTx(t)}>Remove split</button>}
+                                </div>
+                              </td>
+                            </tr>
+                          )}
+                          </React.Fragment>
                         );
                       })}
                     </tbody>
@@ -3751,6 +4140,174 @@ export default function App() {
                 </ResponsiveContainer>
               </div>
             )}
+
+          </div>
+        )}
+
+        {tab === "owed" && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+
+            <div className="panel">
+              <PanelTitle noMargin>IOUs</PanelTitle>
+              <p style={{ margin: "4px 0 16px", fontSize: 13, color: MUTED }}>
+                Track expenses someone else paid on your behalf, or that you paid on someone else's behalf,
+                that never show up in your imported statements. These stay out of your net worth and cash flow totals.
+                "They paid for me" entries count toward your category spend by default, since that's real spend on a real date —
+                untoggle it if you'd rather exclude a specific one. When you pay someone back, categorize that repayment
+                transaction as <strong>Debt Repayment</strong> instead of the original spend category, so it doesn't get counted twice.
+              </p>
+              <div className="grid-stats" style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 14 }}>
+                <StatCard label="You're owed" value={fmtDispCompact(totalTheyOweMe)} positive={true} sub="others owe you" />
+                <StatCard label="You owe" value={fmtDispCompact(totalIOweThem)} positive={false} sub="you owe others" />
+                <StatCard label="Net" value={fmtDispCompact(totalTheyOweMe - totalIOweThem)} positive={totalTheyOweMe - totalIOweThem >= 0} />
+              </div>
+            </div>
+
+            {iouBalances.length > 0 && (
+              <div className="panel">
+                <PanelTitle>Balances by person</PanelTitle>
+                <table>
+                  <thead>
+                    <tr>
+                      <th style={{ textAlign: "left" }}>Person</th>
+                      <th>They owe you</th>
+                      <th>You owe them</th>
+                      <th>Net</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {iouBalances.map(b => (
+                      <tr key={b.person}>
+                        <td style={{ fontWeight: 600 }}>{b.person}</td>
+                        <td style={{ fontFamily: "'JetBrains Mono', monospace" }}>{b.theyOwe > 0 ? fmtDispCompact(b.theyOwe) : <span style={{ color: MUTED }}>—</span>}</td>
+                        <td style={{ fontFamily: "'JetBrains Mono', monospace" }}>{b.iOwe > 0 ? fmtDispCompact(b.iOwe) : <span style={{ color: MUTED }}>—</span>}</td>
+                        <td style={{ fontFamily: "'JetBrains Mono', monospace", fontWeight: 600, color: b.net >= 0 ? "#5f8d6b" : "#b5685a" }}>
+                          {b.net >= 0 ? `+${fmtDispCompact(b.net)}` : `-${fmtDispCompact(Math.abs(b.net))}`}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+
+            <div className="panel">
+              <PanelTitle>{editingIou ? "Edit IOU" : "Add IOU"}</PanelTitle>
+              <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "flex-end" }}>
+                <div>
+                  <label style={{ fontSize: 12, color: MUTED, display: "block", marginBottom: 4 }}>Date</label>
+                  <input className="num-input" type="date" style={{ width: 150 }} value={iouForm.date} onChange={e => setIouForm(f => ({ ...f, date: e.target.value }))} />
+                </div>
+                <div>
+                  <label style={{ fontSize: 12, color: MUTED, display: "block", marginBottom: 4 }}>Direction</label>
+                  <select className="num-input" style={{ width: 190 }} value={iouForm.direction} onChange={e => setIouForm(f => ({ ...f, direction: e.target.value, countInSpend: e.target.value === "they_paid" }))}>
+                    <option value="they_paid">They paid for me (I owe them)</option>
+                    <option value="i_paid">I paid for them (they owe me)</option>
+                  </select>
+                </div>
+                <div>
+                  <label style={{ fontSize: 12, color: MUTED, display: "block", marginBottom: 4 }}>Person</label>
+                  <input className="num-input" style={{ width: 140 }} value={iouForm.person} onChange={e => setIouForm(f => ({ ...f, person: e.target.value }))} placeholder="Name" list="iou-people-list" />
+                  <datalist id="iou-people-list">
+                    {iouPeople.map(p => <option key={p} value={p} />)}
+                  </datalist>
+                </div>
+                <div style={{ flex: 1, minWidth: 160 }}>
+                  <label style={{ fontSize: 12, color: MUTED, display: "block", marginBottom: 4 }}>Description</label>
+                  <input className="num-input" value={iouForm.description} onChange={e => setIouForm(f => ({ ...f, description: e.target.value }))} placeholder="e.g. Dinner at ..." />
+                </div>
+                <div>
+                  <label style={{ fontSize: 12, color: MUTED, display: "block", marginBottom: 4 }}>Amount</label>
+                  <div style={{ display: "flex", gap: 6 }}>
+                    <input className="num-input" type="number" style={{ width: 110 }} value={iouForm.amount} onChange={e => setIouForm(f => ({ ...f, amount: e.target.value }))} placeholder="0" />
+                    <select className="num-input" style={{ width: 80 }} value={iouForm.currency} onChange={e => setIouForm(f => ({ ...f, currency: e.target.value }))}>
+                      {Object.keys(CURRENCIES).map(c => <option key={c}>{c}</option>)}
+                    </select>
+                  </div>
+                </div>
+              </div>
+              <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center", marginTop: 12 }}>
+                <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 13, color: INK }}>
+                  <input type="checkbox" checked={iouForm.countInSpend} onChange={e => setIouForm(f => ({ ...f, countInSpend: e.target.checked }))} />
+                  Count toward category spend
+                </label>
+                {iouForm.countInSpend && (
+                  <select className="num-input" style={{ width: 160 }} value={iouForm.category} onChange={e => setIouForm(f => ({ ...f, category: e.target.value }))}>
+                    {expenseCategories.map(c => <option key={c}>{c}</option>)}
+                  </select>
+                )}
+                {iouForm.countInSpend && iouForm.direction === "i_paid" && (
+                  <span style={{ fontSize: 12, color: "#b5685a" }}>
+                    Heads up: if you paid with a card that's already imported, this amount is likely already counted once — check before enabling.
+                  </span>
+                )}
+              </div>
+              <div style={{ marginTop: 10 }}>
+                <label style={{ fontSize: 12, color: MUTED, display: "block", marginBottom: 4 }}>Notes (optional)</label>
+                <input className="num-input" style={{ width: "100%" }} value={iouForm.notes} onChange={e => setIouForm(f => ({ ...f, notes: e.target.value }))} placeholder="Optional" />
+              </div>
+              <div style={{ display: "flex", gap: 8, marginTop: 14 }}>
+                <button className="btn-primary" onClick={addOrUpdateIou}>{editingIou ? "Save changes" : "Add"}</button>
+                {editingIou && <button className="btn-ghost" onClick={cancelEditIou}>Cancel</button>}
+              </div>
+            </div>
+
+            <div className="panel">
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10, marginBottom: 14 }}>
+                <PanelTitle noMargin>Entries</PanelTitle>
+                <div style={{ display: "flex", gap: 8 }}>
+                  <select className="num-input" value={iouPersonFilter} onChange={e => setIouPersonFilter(e.target.value)}>
+                    <option value="all">All people</option>
+                    {iouPeople.map(p => <option key={p} value={p}>{p}</option>)}
+                  </select>
+                  <select className="num-input" value={iouStatusFilter} onChange={e => setIouStatusFilter(e.target.value)}>
+                    <option value="outstanding">Outstanding</option>
+                    <option value="settled">Settled</option>
+                    <option value="all">All</option>
+                  </select>
+                </div>
+              </div>
+              {filteredIous.length === 0 ? (
+                <p style={{ fontSize: 13, color: MUTED }}>No IOUs here yet.</p>
+              ) : (
+                <table>
+                  <thead>
+                    <tr>
+                      <th style={{ textAlign: "left" }}>Date</th>
+                      <th style={{ textAlign: "left" }}>Person</th>
+                      <th style={{ textAlign: "left" }}>Direction</th>
+                      <th style={{ textAlign: "left" }}>Description</th>
+                      <th>Amount</th>
+                      <th>Status</th>
+                      <th></th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {filteredIous.map(i => (
+                      <tr key={i.id} style={{ opacity: i.status === "settled" ? 0.6 : 1 }}>
+                        <td>{i.date}</td>
+                        <td>{i.person}</td>
+                        <td style={{ fontSize: 12, color: i.direction === "they_paid" ? "#b5685a" : "#5f8d6b" }}>
+                          {i.direction === "they_paid" ? "They paid — I owe" : "I paid — owed to me"}
+                        </td>
+                        <td style={{ fontSize: 13, color: MUTED }}>
+                          {i.description || "—"}
+                          {i.countInSpend && i.category && <span style={{ marginLeft: 6, fontSize: 11, background: "#faf8f5", border: `1px solid ${BORDER}`, borderRadius: 4, padding: "1px 6px" }}>{i.category}</span>}
+                          {i.linkedTxId && <span style={{ marginLeft: 6, fontSize: 11, background: "#5b7c9922", color: "#5b7c99", borderRadius: 4, padding: "1px 6px" }} title="Auto-created from a split transaction — edit the split on that transaction to change this">linked</span>}
+                        </td>
+                        <td style={{ fontFamily: "'JetBrains Mono', monospace", fontWeight: 600 }}>{fmtIou(i)}</td>
+                        <td style={{ fontSize: 12 }}>{i.status === "outstanding" ? "Outstanding" : `Settled${i.settledDate ? " " + i.settledDate : ""}`}</td>
+                        <td style={{ display: "flex", gap: 6, justifyContent: "flex-end" }}>
+                          <button className="btn-icon" onClick={() => toggleIouSettled(i.id)}>{i.status === "outstanding" ? "Mark settled" : "Reopen"}</button>
+                          <button className="btn-icon" onClick={() => startEditIou(i)}>Edit</button>
+                          <button className="btn-icon" onClick={() => deleteIou(i.id)}>✕</button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </div>
 
           </div>
         )}
